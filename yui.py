@@ -13,7 +13,7 @@ import httpx
 import re
 import requests
 import time
-from typing import AsyncGenerator, Callable, Awaitable, Optional, List, Tuple
+from typing import AsyncGenerator, Callable, Awaitable, Optional, Dict, List, Tuple
 from pydantic import BaseModel, Field
 import asyncio
 from jinja2 import Template
@@ -30,9 +30,6 @@ from open_webui.models.messages import (
 )
 from open_webui.retrieval.vector.connector import VECTOR_DB_CLIENT
 from langchain_core.documents import Document
-from open_webui.retrieval.utils import (
-    generate_embeddings,
-)
 from open_webui.models.knowledge import (
     Knowledges,
     KnowledgeForm,
@@ -47,12 +44,12 @@ log = logging.getLogger(__name__)
 log.setLevel("DEBUG")
 
 @dataclass
-class RAGResultObject:
+class VectorDBResultObject:
     id_: str
     distance: float
     document: str
-    metadata: dict
-
+    metadata: Dict
+    query_embedding: List
 
 class EventFlags:
     def __init__(self):
@@ -91,7 +88,7 @@ class Pipe:
             description="语言模型API的基础请求地址",
         )
         MODEL_API_KEY: str = Field(default="", description="用于身份验证的API密钥")
-        MAIN_MODEL: str = Field(
+        BASE_MODEL: str = Field(
             default="deepseek-ai/deepseek-r1:671b",
             description="对话的模型名称",
         )
@@ -124,6 +121,7 @@ class Pipe:
 
     def __init__(self):
         # Configs
+        self.model_id = "Yui-000"
         self.valves = self.Valves()
         self.data_prefix = "data: "
         self.TOOL = {}
@@ -172,8 +170,8 @@ class Pipe:
 
         return [
             {
-                "id": "Yui-000",
-                "name": "Yui-000",
+                "id": self.model_id,
+                "name": self.model_id,
             }
         ]
 
@@ -195,7 +193,7 @@ class Pipe:
             # 初始化知识库
             await self.init_knowledge()
             # 获取请求参数
-            payload = {**body, "model": self.valves.MAIN_MODEL}
+            payload = {**body, "model": self.valves.BASE_MODEL}
             messages = payload["messages"]
             # TODO
             # self.process_message_figures(messages)
@@ -328,7 +326,7 @@ class Pipe:
         log.debug("Initializing knowledge bases")
         self.knowledges = {}  # 初始化知识库字典
         try:
-            self.long_chat_db_name = "Yui-001-LTM-" + self.user_id  # 长期记忆
+            self.long_chat_db_name = f"{self.model_id}-LTM-{self.user_id}"  # 长期记忆
             knowledge_bases = Knowledges.get_knowledge_bases_by_user_id(
                 self.user_id, "read"
             )  # 获取知识库
@@ -350,7 +348,7 @@ class Pipe:
                 )
                 form_data = KnowledgeForm(
                     name=self.long_chat_db_name,
-                    description="Long term memory for Yui-001",
+                    description=f"Long term memory for ${self.model_id}",
                     access_control={},
                 )
                 self.knowledges[self.long_chat_db_name] = (
@@ -522,9 +520,9 @@ class Pipe:
         )
         return emoji_pattern.sub(r"", text)  # no emoji
 
-    async def get_embeddings(self, text):
+    async def get_single_embedding(self, text):
         """调用API获取文本嵌入"""
-        headers = {"Authorization": f"Bearer {self.valves.MODEL_API_KEY}"}
+a       headers = {"Authorization": f"Bearer {self.valves.MODEL_API_KEY}"}
         response = requests.post(
             f"{self.valves.MODEL_API_BASE_URL}/embeddings",
             headers=headers,
@@ -555,20 +553,20 @@ class Pipe:
         # 滑动窗口获取嵌入向量
         window_size = 3
         window_step = 1
-        sim_threshold = 0.7
+        sim_threshold = 0.8
 
         for i in range(len(self.round_buffer.sentences) - sentence_n, len(self.round_buffer.sentences)):
             begin_idx = i - window_size + 1
             if begin_idx < 0:
                 continue
 
-            log.debug("获取滑动窗口嵌入向量...")
+            log.debug("Sliding window embedding...")
             window = "".join(self.round_buffer.sentences[begin_idx : i + 1])
 
             if window.strip() == "":
                 continue
 
-            self.round_buffer.window_embeddings.append(await self.get_embeddings(window))
+            self.round_buffer.window_embeddings.append(await self.get_single_embedding(window))
             if len(self.round_buffer.window_embeddings) > 1:
                 similarity = self.cosine_similarity(
                     self.round_buffer.window_embeddings[-2], self.round_buffer.window_embeddings[-1]
@@ -614,6 +612,74 @@ class Pipe:
             )
             # TODO: submit async rag
             self.session_buffer.rag_queue.pop()
+    
+    async def point_search_vector_db_file(file_name, embedding, top_k, max_distance):
+        result = VECTOR_DB_CLIENT.search(
+            collection_name=file_name,
+            vectors=[embedding],
+            limit=top_k,
+        )
+        # sanity check
+        if not result:
+            return []
+
+        if not all(
+            hasattr(result, attr)
+            for attr in ["ids", "distances", "documents", "metadatas"]
+        ):
+            return []
+
+        if (
+            not result.ids
+            or not result.distances
+            or not result.documents
+            or not result.metadatas
+        ):
+            return []
+
+        result_objects = []
+
+        for i in range(len(result.ids)):
+            if result.distances[i] > max_distance:
+                continue
+            result_objects.append(
+                VectorDBResultObject(
+                    id_=result.ids[i],
+                    distance=result.distances[i],
+                    document=result.documents[i],
+                    metadata=result.metadatas[i],
+                    query_embedding=embedding,
+                )
+            )
+
+        return result_objects
+
+    async def query_collection(
+            self, knowledge_name: str, query_keywords: str, top_k: int = 1, max_distance: float = 0.5
+    ) -> list:
+        embeddings = None
+        query_keywords = query_keyworsd.strip()
+        # Generate query embedding
+        log.debug(f"Generating Embeddings")
+        query_embedding = await self.get_single_embedding(query_keywords)
+        # Get knowledge object
+        knowledge = self.knowledges.get(knowledge_name, [])
+        if not knowledge:
+            raise ValueError(
+                f"No knowledge name {knowledge_name} found in knowledge base. Availables knowledges: {vars(self.knowledges.keys())}"
+            )
+        # Parallel search for files
+        log.debug("Searching files in Vector DB")
+        file_names = ["file-" + file_id for file_id in knowledge.data["file_ids"]]
+        tasks = [point_search_vector_db_file(file_name, query_embedding, top_k, max_distance) for file_name in file_names]
+        results = await asyncio.gather(*tasks)
+        # flatten
+        all_results = [result for sublist in results for result in sublist]
+        # sort by distance
+        all_results.sort(key=lambda x: x.distance)
+        top_results = all_results[:top_k]
+
+        return top_results
 
     def DEFAULT_CODE_INTERFACE_PROMPT(self):
         return ""
