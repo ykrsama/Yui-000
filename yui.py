@@ -1,8 +1,8 @@
 """
-title: Yui-001
+title: Yui-000
 author: Xuliang (xuliangz@sjtu.edu.cn)
-description: OpenWebUI pipe function for Yui-001
-version: 0.0.1
+description: OpenWebUI pipe function for Yui-000
+version: 0.0.0
 licence: MIT
 """
 
@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 import asyncio
 from jinja2 import Template
 from datetime import datetime
+from dataclasses import dataclass
 from open_webui.utils.misc import (
     add_or_update_user_message,
 )
@@ -45,13 +46,41 @@ import numpy as np
 log = logging.getLogger(__name__)
 log.setLevel("DEBUG")
 
-
+@dataclass
 class RAGResultObject:
-    def __init__(self, id, distance, document, metadata):
-        self.id = id
-        self.distance = distance
-        self.document = document
-        self.metadata = metadata
+    id_: str
+    distance: float
+    document: str
+    metadata: dict
+
+
+class EventFlags:
+    def __init__(self):
+        self.thinking_state: int = -1
+        self.early_end_round = False
+        self.mem_updated = False
+
+class SessionBuffer:
+    def __init__(self):
+        self.rag_queue = []
+        # TODO: Memory
+        # Sensor
+        # 写入文件、读取文件
+
+class RoundBuffer:
+    def __init__(self):
+        self.sentence_buffer: str = ""
+        self.sentences: List[str] = []
+        self.window_embeddings: List = []
+        self.paragraph_begin_id: int = 0
+        self.total_response = ""
+
+    def reset(self):
+        self.sentence_buffer = ""
+        self.sentences = []
+        self.window_embeddings = []
+        self.paragraph_begin_id = 0
+        self.total_response = ""
 
 
 class Pipe:
@@ -71,12 +100,14 @@ class Pipe:
             description="用于获取文本嵌入的模型名称",
         )
         # RAG配置
-        RAG_AT_TEST_TIME: bool = Field(default=True)
+        REALTIME_RAG: bool = Field(default=True, description="Realtime seaching Vector DB")
         RAG_COLLECTION_NAMES: str = Field(default="DarkSHINE_Simulation_Software")
         EMBEDDING_BATCH_SIZE: int = Field(
             default=2000,
             description="Batch size for RAG",
         )
+        # 环境交互配置
+        REALTIME_IO: bool = Field(default=True, description="Realtime Interact with environment and sense environment change")
         # 提示词配置
         USE_DARKSHINE_GUIDE: bool = Field(default=False, title="Use DarkSHINE Guide")
         USE_BESIII_GUIDE: bool = Field(default=False, title="Use BESIII Guide")
@@ -95,27 +126,22 @@ class Pipe:
         # Configs
         self.valves = self.Valves()
         self.data_prefix = "data: "
-        self.client = None
         self.TOOL = {}
         self.prompt_templates = {}
         self.replace_tags = {"web_search": "Searching"}
+        self.rag_queue_max = 1
+        # Global objects
+        self.client = None
+        self.code_worker = None
         # Global vars
         self.user_id: str = ""
         self.chat_id: str = ""
         self.message_id: str = ""
-        self.long_term_memory: str = ""
-        self.total_response = ""
-        self.temp_content = ""  # Temporary string to hold accumulated content
-        self.current_tag_name = None
-        self.immediate_stop = False
-        self.code_worker = None
-        self.op_system = "Linux"  # code worker system
-        self.rag_queue = []
-        self.rag_queue_max = 1
-        self.sentence_buffer: str = ""
-        self.sentences: List[str] = []
-        self.window_embeddings: List[str] = []
-        self.paragraph_begin_id = 0
+        self.op_system = "Linux"  # auto read from code worker
+        self.long_chat_db_name: str = ""  # Based on user_id
+        self.event_flags: EventFlags = EventFlags()
+        self.session_buffer: SessionBuffer = SessionBuffer()
+        self.round_buffer: RoundBuffer = RoundBuffer()
 
     def pipes(self):
         self.max_loop = self.valves.MAX_LOOP
@@ -146,8 +172,8 @@ class Pipe:
 
         return [
             {
-                "id": "Yui-001",
-                "name": "Yui-001",
+                "id": "Yui-000",
+                "name": "Yui-000",
             }
         ]
 
@@ -167,22 +193,16 @@ class Pipe:
             # 获取chat id, user id, message id
             self.extract_event_info(__event_emitter__)
             # 初始化知识库
-            self.init_knowledge()
-            # 初始化buffer
-            self.sentence_buffer = ""
-            self.sentences = []
-            self.window_embeddings = []
-            self.rag_queue = []
-            self.paragraph_begin_id = 0
+            await self.init_knowledge()
             # 获取请求参数
             payload = {**body, "model": self.valves.MAIN_MODEL}
             messages = payload["messages"]
             # TODO
             # self.process_message_figures(messages)
             # User proxy转移到User 角色以保护身份认同
-            self.transfer_userproxy_role(messages)
+            await self.transfer_userproxy_role(messages)
             # 处理消息以防止相同的角色
-            self.merge_adjacent_roles(messages)
+            await self.merge_adjacent_roles(messages)
             # TODO
             # self.set_system_prompt(messages)
 
@@ -193,11 +213,13 @@ class Pipe:
             create_new_round = True
             round_count = 0
             while create_new_round and round_count < self.max_loop:
-                if len(self.rag_queue) > self.rag_queue_max:
+                
+                # RAG队列大于阈值时等待，再继续下一轮
+                if len(self.session_buffer.rag_queue) > self.rag_queue_max:
                     await asyncio.sleep(0.02)
                     continue
 
-                thinking_state = {"thinking": -1}  # 使用字典来存储thinking状态
+                log.info("Starting chat round")
                 async with self.client.stream(
                     "POST",
                     f"{self.valves.MODEL_API_BASE_URL}/chat/completions",
@@ -233,20 +255,17 @@ class Pipe:
                         choice = data.get("choices", [{}])[0]
 
                         # 结束条件判断
-                        if choice.get("finish_reason") or self.immediate_stop:
+                        if choice.get("finish_reason") or self.event_flags.early_end_round:
                             log.info("Finishing chat")
-                            sentence_n = self.finalize_sentences()
-                            if sentence_n:
-                                self.process_deltas(sentence_n)
+                            await self.finalize_sentences()
+                            self.round_buffer.reset()
 
                             # TODO
                             create_new_round = False
                             break
 
                         # 状态机处理
-                        state_output = await self.update_thinking_state(
-                            choice.get("delta", {}), thinking_state
-                        )
+                        state_output = await self.update_thinking_state(choice.get("delta", {}))
                         if state_output:
                             yield state_output  # 直接发送状态标记
                             if state_output == "<think>":
@@ -256,18 +275,37 @@ class Pipe:
                         # 内容处理
                         content = self.process_content(choice["delta"])
                         if content:
-                            # 根据语义分割段落
-                            sentence_n = self.update_sentence_buffer(content)
-                            if sentence_n:
-                                self.process_deltas(sentence_n)
-
                             yield content
+                            if self.valves.REALTIME_RAG:
+                                # 根据语义分割段落
+                                sentence_n = await self.update_sentence_buffer(content)
+                                if sentence_n:
+                                    await self.process_deltas(sentence_n)
 
+                        # 判断是否打断当前生成并进入下一轮
+                        if self.check_break_and_new_round():
+                            break
+                      
                 log.debug(messages[-1:])
                 round_count += 1
 
         except Exception as e:
             yield self.format_exception(e)
+
+    def check_break_and_new_round(self):
+        if_break = False
+        # 工作记忆更新时打断
+        if self.event_flags.mem_updated:
+            break_flag = True
+        # RAG队列长度超过阈值时打断
+        if len(self.session_buffer.rag_queue) > self.rag_queue_max:
+            break_flag = True
+        # Cleanup
+        if if_break:
+            log.info("Breaking chat round and resetting flags")
+            self.event_flags.mem_updated = False
+        return if_break
+            
 
     def extract_event_info(self, event_emitter):
         if not event_emitter or not event_emitter.__closure__:
@@ -283,14 +321,14 @@ class Pipe:
         err_type = type(e).__name__
         return json.dumps({"error": f"{err_type}: {str(e)}"}, ensure_ascii=False)
 
-    def init_knowledge(self):
+    async def init_knowledge(self):
         """
         初始化知识库数据，将其存储在 self.knowledges 字典中。
         """
         log.debug("Initializing knowledge bases")
         self.knowledges = {}  # 初始化知识库字典
         try:
-            self.long_term_memory = "Yui-001-LTM-" + self.user_id  # 长期记忆
+            self.long_chat_db_name = "Yui-001-LTM-" + self.user_id  # 长期记忆
             knowledge_bases = Knowledges.get_knowledge_bases_by_user_id(
                 self.user_id, "read"
             )  # 获取知识库
@@ -306,16 +344,16 @@ class Pipe:
                 else:
                     log.warning("Found a knowledge base without a name, skipping it.")
 
-            if not self.long_term_memory in self.knowledges:
+            if not self.long_chat_db_name in self.knowledges:
                 log.info(
-                    f"Creating long term memory knowledge base: {self.long_term_memory}"
+                    f"Creating long term memory knowledge base: {self.long_chat_db_name}"
                 )
                 form_data = KnowledgeForm(
-                    name=self.long_term_memory,
+                    name=self.long_chat_db_name,
                     description="Long term memory for Yui-001",
                     access_control={},
                 )
-                self.knowledges[self.long_term_memory] = (
+                self.knowledges[self.long_chat_db_name] = (
                     Knowledges.insert_new_knowledge(self.user_id, form_data)
                 )
 
@@ -326,10 +364,10 @@ class Pipe:
         except Exception as e:
             raise Exception(f"Failed to initialize knowledge bases: {str(e)}")
 
-    def process_message_figures(self):
+    async def process_message_figures(self):
         pass
 
-    def transfer_userproxy_role(self, messages):
+    async def transfer_userproxy_role(self, messages):
         log.info("Transferring user proxy messages to user role")
         i = 0
         while i < len(messages):
@@ -386,7 +424,7 @@ class Pipe:
 
             i += 1
 
-    def merge_adjacent_roles(self, messages):
+    async def merge_adjacent_roles(self, messages):
         log.info("Merging adjacent messages with the same role")
         i = 0
         while i < len(messages) - 1:
@@ -399,22 +437,22 @@ class Pipe:
                 messages.pop(i + 1)
             i += 1
 
-    async def update_thinking_state(self, delta: dict, thinking_state: dict) -> str:
+    async def update_thinking_state(self, delta: dict,) -> str:
         """更新思考状态机（简化版）"""
         state_output = ""
 
         # 状态转换：未开始 -> 思考中
-        if thinking_state["thinking"] == -1 and delta.get("reasoning_content"):
-            thinking_state["thinking"] = 0
+        if self.event_flags.thinking_state == -1 and delta.get("reasoning_content"):
+            self.event_flags.thinking_state = 0
             state_output = "<think>"
 
         # 状态转换：思考中 -> 已回答
         elif (
-            thinking_state["thinking"] == 0
+            self.event_flags.thinking_state == 0
             and not delta.get("reasoning_content")
             and delta.get("content")
         ):
-            thinking_state["thinking"] = 1
+            self.event_flags.thinking_state = 1
             state_output = "\n</think>\n\n"
 
         return state_output
@@ -425,44 +463,51 @@ class Pipe:
             return delta.get("reasoning_content", "")
         elif delta.get("content", ""):
             delta = delta.get("content", "")
-            self.total_response += delta
+            self.round_buffer.total_response += delta
             return delta
 
-    def update_sentence_buffer(self, text) -> int:
+    async def update_sentence_buffer(self, text) -> int:
         """
         更新句子缓冲区，将文本分割成句子并添加到句子列表中。
         :param text: 要添加到缓冲区的文本
         :return: 添加到句子列表的句子数量
         """
-        self.sentence_buffer += text
+        self.round_buffer.sentence_buffer += text
         pattern = r'(?<=[。！？“”])|(?<=\n)|(?<=[.!?]\s)|(?<=")'
-        splits = re.split(pattern, self.sentence_buffer)
+        splits = re.split(pattern, self.round_buffer.sentence_buffer)
         if len(splits) > 1:
+            sentence_len_old = len(self.round_buffer.sentences)
             for i in range(len(splits) - 1):
                 mark_pattern = r"^[\s\W_]+$"  # 纯符号
                 if (
                     re.match(mark_pattern, splits[i].strip())
-                    and len(self.sentences) > 0
+                    and len(self.round_buffer.sentences) > 0
                 ):
-                    self.sentences[-1] += splits[i]
+                    self.round_buffer.sentences[-1] += splits[i]
                 else:
-                    self.sentences.append(splits[i])
-            self.sentence_buffer = splits[-1]
-            return len(splits) - 1
-        return 0
-
-    def finalize_sentences(self) -> int:
-        """
-        将缓冲区中的文本添加到句子列表中。
-        :return: 添加到句子列表的句子数量
-        """
-        if self.sentence_buffer:
-            self.sentences.append(self.sentence_buffer)
-            self.sentence_buffer = ""
-            return 1
+                    self.round_buffer.sentences.append(splits[i])
+            self.round_buffer.sentence_buffer = splits[-1]
+            sentence_len_new = len(self.round_buffer.sentences)
+            return sentence_len_new - sentence_len_old
         return 0
 
     # RAG
+
+    async def _query_collection(
+        self, knowledge_name: str, query_keywords: str, top_k: int = 3
+    ) -> list:
+        """
+        Query the vector database by knowledge name and keywords, and return metadata and contexts.
+
+        Args:
+            knowledge_name (str): The name of the knowledge to query.
+            query_keywords (str): The query keywords to search for.
+            top_k (int): The number of top results to retrieve.
+
+        Returns:
+            list: A list of dictionaries containing metadata and context documents.
+        """
+
 
     def clean_text(self, text):
         # 去除emoji，避免embedding报错
@@ -477,7 +522,7 @@ class Pipe:
         )
         return emoji_pattern.sub(r"", text)  # no emoji
 
-    def get_embeddings(self, text):
+    async def get_embeddings(self, text):
         """调用API获取文本嵌入"""
         headers = {"Authorization": f"Bearer {self.valves.MODEL_API_KEY}"}
         response = requests.post(
@@ -506,36 +551,69 @@ class Pipe:
         """计算余弦相似度"""
         return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-    def process_deltas(self, sentence_n):
+    async def process_deltas(self, sentence_n):
         # 滑动窗口获取嵌入向量
         window_size = 3
         window_step = 1
-        sim_threshold = 0.8
+        sim_threshold = 0.7
 
-        for i in range(len(self.sentences) - sentence_n, len(self.sentences)):
+        for i in range(len(self.round_buffer.sentences) - sentence_n, len(self.round_buffer.sentences)):
             begin_idx = i - window_size + 1
             if begin_idx < 0:
                 continue
 
             log.debug("获取滑动窗口嵌入向量...")
-            window = "".join(self.sentences[begin_idx : i + 1])
-            log.debug(f"Window: {window}")
-            self.window_embeddings.append(self.get_embeddings(window))
-            if len(self.window_embeddings) > 1:
+            window = "".join(self.round_buffer.sentences[begin_idx : i + 1])
+
+            if window.strip() == "":
+                continue
+
+            self.round_buffer.window_embeddings.append(await self.get_embeddings(window))
+            if len(self.round_buffer.window_embeddings) > 1:
                 similarity = self.cosine_similarity(
-                    self.window_embeddings[-2], self.window_embeddings[-1]
+                    self.round_buffer.window_embeddings[-2], self.round_buffer.window_embeddings[-1]
                 )
                 if similarity < sim_threshold:
                     paragraph = "".join(
-                        self.sentences[self.paragraph_begin_id : begin_idx]
+                        self.round_buffer.sentences[self.round_buffer.paragraph_begin_id : begin_idx]
                     )
-                    self.rag_queue.append(paragraph)
-                    self.paragraph_begin_id = begin_idx
+                    self.session_buffer.rag_queue.append(paragraph)
+                    self.round_buffer.paragraph_begin_id = begin_idx
                     log.debug(
-                        f"Add rag queue: {paragraph}\nNext Similarity: {similarity}"
+                        f"Add rag queue:\n {paragraph}\nNext Similarity: {similarity}"
                     )
                     # TODO: submit async rag
-                    self.rag_queue.pop()
+                    self.session_buffer.rag_queue.pop()
+
+    async def finalize_sentences(self) -> int:
+        """
+        将缓冲区中的文本添加到句子列表中。
+        :return: 添加到句子列表的句子数量
+        """
+        sentence_n = 0
+        if self.round_buffer.sentence_buffer:
+            sentence_len_old = len(self.round_buffer.sentences)
+            mark_pattern = r"^[\s\W_]+$"  # 纯符号
+            if (
+                re.match(mark_pattern, self.round_buffer.sentence_buffer.strip())
+                and len(self.round_buffer.sentences) > 0
+            ):
+                self.round_buffer.sentences[-1] += self.round_buffer.sentence_buffer
+            else:
+                self.round_buffer.sentences.append(self.round_buffer.sentence_buffer)
+            self.round_buffer.sentence_buffer = ""
+            sentence_len_new = len(self.round_buffer.sentences)
+            sentence_n =  sentence_len_new - sentence_len_old
+        if len(self.round_buffer.sentences) - self.round_buffer.paragraph_begin_id > 0:
+            paragraph = "".join(
+                self.round_buffer.sentences[self.round_buffer.paragraph_begin_id:]
+            )
+            self.session_buffer.rag_queue.append(paragraph)
+            log.debug(
+                f"Add rag queue:\n {paragraph}"
+            )
+            # TODO: submit async rag
+            self.session_buffer.rag_queue.pop()
 
     def DEFAULT_CODE_INTERFACE_PROMPT(self):
         return ""
