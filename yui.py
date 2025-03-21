@@ -277,7 +277,7 @@ class Pipe:
                         #======================================================
                         # 内容处理
                         #======================================================
-                        content = self.process_content(choice["delta"])
+                        content = self.process_content(choice["delta"], round_buffer)
                         if content:
                             yield content
                             if do_semantic_segmentation:
@@ -300,9 +300,11 @@ class Pipe:
                 round_count += 1
 
         except Exception as e:
-            yield self.format_exception(e)
+            err_type = type(e).__name__
+            yield json.dumps({"error": f"{err_type}: {str(e)}"}, ensure_ascii=False)
 
     def check_break_and_new_round(self, session_buffer: SessionBuffer, event_flags: EventFlags):
+        log.debug("Checking break and new round")
         if_break = False
         # 工作记忆更新时打断
         if event_flags.mem_updated:
@@ -330,10 +332,6 @@ class Pipe:
                 message_id = request_info.get("message_id")
         return user_id, chat_id, message_id
 
-    def format_exception(self, e: Exception) -> str:
-        err_type = type(e).__name__
-        return json.dumps({"error": f"{err_type}: {str(e)}"}, ensure_ascii=False)
-
     async def init_knowledge(self, user_id: str) -> Tuple[Dict, str]:
         """
         初始化知识库数据，将其存储在 knowledges 字典中。
@@ -348,7 +346,7 @@ class Pipe:
                 user_id, "read"
             )  # 获取知识库
             # 获取知识库名称列表
-            rag_collection_names = [name.strip() in self.valves.RAG_COLLECTION_NAMES.split(',')]
+            rag_collection_names = [name.strip() for name in self.valves.RAG_COLLECTION_NAMES.split(',')]
             # 遍历知识库列表
             for knowledge in knowledge_bases:
                 knowledge_name = knowledge.name  # 获取知识库名称
@@ -534,7 +532,6 @@ class Pipe:
             },
         )
         if response.status_code != 200:
-            print(f"API Error: {response.status_code} - {response.text}")
             raise Exception(f"API Error: {response.status_code} - {response.text}")
 
         data = response.json()
@@ -591,7 +588,7 @@ class Pipe:
                         f"New paragraph:\n {paragraph}\nNext Similarity: {similarity}"
                     )
 
-            return new_paragraphs
+        return new_paragraphs
 
     async def finalize_sentences(self, session_buffer: SessionBuffer, round_buffer: RoundBuffer) -> int:
         """
@@ -600,6 +597,7 @@ class Pipe:
         :param round_buffer: 轮次缓冲区
         :return: 添加到句子列表的句子数量
         """
+        log.debug("Finalizing sentences")
         sentence_n = 0
         if round_buffer.sentence_buffer:
             sentence_len_old = len(round_buffer.sentences)
@@ -626,6 +624,7 @@ class Pipe:
             session_buffer.rag_queue.pop()
     
     async def point_search_vector_db_file(file_name, embedding, top_k, max_distance):
+        log.debug("Searching Vector DB")
         result = VECTOR_DB_CLIENT.search(
             collection_name=file_name,
             vectors=[embedding],
@@ -669,6 +668,7 @@ class Pipe:
     async def query_collection(
             self, query_keywords: str, knowledges: Dict[str, Knowledges], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0.5
     ) -> list:
+        log.debug("Querying Collection")
         embeddings = None
         query_keywords = query_keyworsd.strip()
         # Generate query embedding
