@@ -145,7 +145,8 @@ class WorkingMemory:
     def __str__(self):
         output = ""
         for obj in self.objects:
-            source = obj.metadata.get("source", "Unknown")
+            log.debug(obj.metadata)
+            source = obj.metadata.get("source", "Unknown").replace("~", "/")
             output += f"<context source=\"{source}\">\n{obj.document}\n</context>\n\n"
         return output
 
@@ -205,7 +206,7 @@ class Pipe:
         )
         # RAG配置
         REALTIME_RAG: bool = Field(default=True, description="Realtime seaching Vector DB")
-        RAG_COLLECTION_NAMES: str = Field(default="Physics Software")
+        RAG_COLLECTION_NAMES: str = Field(default="Yui-000-Source, DarkSHINE_Simulation_Software")
         EMBEDDING_BATCH_SIZE: int = Field(
             default=2000,
             description="Batch size for RAG",
@@ -759,7 +760,7 @@ class Pipe:
                     continue
                 embeddings.append(item["embedding"])
         except Exception as e:
-            log.error(f"Failed to get embedding for text: {text}\nError: {e}")
+            log.error(f"Failed to get embedding for texts: {texts}\nError: {e}")
         return embeddings
 
     def cosine_similarity(self, a, b):
