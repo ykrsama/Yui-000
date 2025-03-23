@@ -7,15 +7,16 @@ licence: MIT
 """
 
 import logging
-import io, sys
+import io, sys, os
 import json
 import httpx
 import re
 import requests
-import time
 from typing import AsyncGenerator, Callable, Awaitable, Optional, Dict, List, Tuple
 from pydantic import BaseModel, Field
 import asyncio
+import threading
+from queue import Queue
 from jinja2 import Template
 from datetime import datetime
 from dataclasses import dataclass
@@ -43,6 +44,60 @@ import numpy as np
 log = logging.getLogger(__name__)
 log.setLevel("DEBUG")
 
+class ManagedThread(threading.Thread):
+    """自定义线程类，用于在线程结束时自动从管理器移除"""
+    def __init__(self, manager, target, args, kwargs):
+        super().__init__(target=target, args=args, kwargs=kwargs)
+        self.manager = manager  # 持有管理器实例的引用
+
+    def run(self):
+        try:
+            super().run()       # 执行目标函数
+        except Exception as e:
+            log.error(f"Thread error: {e}")
+        finally:
+            self.manager.remove_thread(self)  # 确保无论是否异常都执行移除操作
+
+class ThreadManager:
+    """线程管理器类"""
+    def __init__(self):
+        self.threads = []       # 存储活跃线程的容器
+        self.lock = threading.Lock()  # 保证线程安全的锁
+
+    def submit(self, target, args=(), kwargs=None):
+        """提交新线程到线程池"""
+        if kwargs is None:
+            kwargs = {}
+            
+        # 创建托管线程实例
+        thread = ManagedThread(self, target, args, kwargs)
+        
+        # 使用锁保证线程安全地添加线程
+        with self.lock:
+            self.threads.append(thread)
+        
+        thread.start()  # 注意：先添加后启动保证移除操作有效性
+
+    def remove_thread(self, thread):
+        """从容器中移除已完成的线程"""
+        with self.lock:
+            if thread in self.threads:
+                self.threads.remove(thread)
+
+    def join_all(self):
+        """等待所有线程执行完成"""
+        # 复制当前线程列表避免遍历时修改
+        with self.lock:
+            current_threads = list(self.threads)
+            
+        for thread in current_threads:
+            thread.join()  # 等待每个线程完成
+
+    def active_count(self):
+        """获取当前活跃线程数量"""
+        with self.lock:
+            return len(self.threads)
+
 @dataclass
 class VectorDBResultObject:
     id_: str
@@ -51,18 +106,64 @@ class VectorDBResultObject:
     metadata: Dict
     query_embedding: List
 
+class WorkingMemory:
+    def __init__(self, chat_id, max_size=10):
+        self.filename = f"working_memory_{chat_id}.json"
+        self.max_size = max_size
+        self.objects: List[VectorDBResultObject] = []
+        self.load()
+
+    def add_object(self, new_object) -> bool:
+        is_new = True
+        # check if new_object already exists, move it to the end
+        for i, obj in enumerate(self.objects):
+            if obj.document == new_object.document:
+                self.objects.pop(i)
+                is_new = False
+
+        self.objects.append(new_object)
+
+        # Remove the oldest
+        if len(self.objects) > self.max_size:
+            self.objects.pop(0)
+
+        return is_new
+
+    def save(self):
+        with open(self.filename, 'w') as file:
+            json.dump([asdict(obj) for obj in self.objects], file)
+
+    def load(self):
+        log.info("Loading working memory...")
+        if os.path.exists(self.filename):
+            with open(self.filename, 'r') as file:
+                data = json.load(file)
+                self.objects = [VectorDBResultObject(**obj) for obj in data]
+        else:
+            log.info("No working memory file found.")
+
+    def __str__(self):
+        output = ""
+        for obj in self.objects:
+            source = obj.metadata.get("source", "Unknown")
+            output += f"<context source=\"{source}\">\n{obj.document}\n</context>\n\n"
+        return output
+
+    def __repr__(self):
+        return str(self.objects)
+
 class EventFlags:
     def __init__(self):
-        self.thinking_state: int = -1
+        self.thinking_state: int = 0
         self.early_end_round = False
         self.mem_updated = False
 
 class SessionBuffer:
-    def __init__(self):
-        self.rag_queue = []
-        # TODO: Memory
-        # Sensor
-        # 写入文件、读取文件
+    def __init__(self, chat_id):
+        self.rag_thread_mgr: ThreadManager = ThreadManager()
+        self.rag_result_queue: Queue = Queue()
+        self.memory: WorkingMemory = WorkingMemory(chat_id)
+        # TODO: Sensor
 
 class RoundBuffer:
     def __init__(self):
@@ -71,6 +172,7 @@ class RoundBuffer:
         self.window_embeddings: List = []
         self.paragraph_begin_id: int = 0
         self.total_response = ""
+        self.reasoning_content = ""
 
     def reset(self):
         self.sentence_buffer = ""
@@ -78,7 +180,7 @@ class RoundBuffer:
         self.window_embeddings = []
         self.paragraph_begin_id = 0
         self.total_response = ""
-
+        self.reasoning_content = ""
 
 class Pipe:
     class Valves(BaseModel):
@@ -92,13 +194,18 @@ class Pipe:
             default="deepseek-ai/deepseek-r1:671b",
             description="对话的模型名称",
         )
+        EMBEDDING_API_BASE_URL: str = Field(
+            default="http://127.0.0.1:11434/v1",
+            description="文本嵌入API的基础请求地址",
+        )
+        EMBEDDING_API_KEY: str = Field(default="", description="用于身份验证的API密钥")
         EMBEDDING_MODEL: str = Field(
-            default="hepai/bge-m3:latest",
+            default="bge-m3:latest",
             description="用于获取文本嵌入的模型名称",
         )
         # RAG配置
         REALTIME_RAG: bool = Field(default=True, description="Realtime seaching Vector DB")
-        RAG_COLLECTION_NAMES: str = Field(default="DarkSHINE_Simulation_Software")
+        RAG_COLLECTION_NAMES: str = Field(default="Physics Software")
         EMBEDDING_BATCH_SIZE: int = Field(
             default=2000,
             description="Batch size for RAG",
@@ -125,7 +232,7 @@ class Pipe:
         self.valves = self.Valves()
         self.data_prefix = "data: "
         self.replace_tags = {"web_search": "Searching"}
-        self.rag_queue_max = 1
+        self.rag_thread_max = 1
 
     def pipes(self):
 
@@ -152,12 +259,15 @@ class Pipe:
             #==================================================================
             # 初始化变量
             #==================================================================
+            # 获取chat id, user id, message id
+            user_id, chat_id, message_id = self.extract_event_info(__event_emitter__)
+
             event_flags: EventFlags = EventFlags()
-            session_buffer: SessionBuffer = SessionBuffer()
+            session_buffer: SessionBuffer = SessionBuffer(chat_id)
             round_buffer: RoundBuffer = RoundBuffer()
 
-            if self.valves.REALTIME_RAG or self.valves.REALTIME_IO:
-                do_semantic_segmentation = True
+            # 初始化知识库
+            knowledges, long_chat_db_name = await self.init_knowledge(user_id)
 
             # Initialize client
             client = httpx.AsyncClient(
@@ -171,6 +281,9 @@ class Pipe:
             code_worker = None
             code_worker_op_system = "Linux"
 
+            if self.valves.REALTIME_RAG or self.valves.REALTIME_IO:
+                do_semantic_segmentation = True
+
             if self.valves.USE_CODE_INTERFACE:
                 TOOL["code_interface"] = self._code_interface
                 prompt_templates["code_interface"] = (
@@ -180,12 +293,6 @@ class Pipe:
             if self.valves.USE_WEB_SEARCH:
                 TOOL["web_search"] = self._web_search
                 prompt_templates["web_search"] = self.DEFAULT_WEB_SEARCH_PROMPT()
-
-            # 获取chat id, user id, message id
-            user_id, chat_id, message_id = self.extract_event_info(__event_emitter__)
-
-            # 初始化知识库
-            knowleges, long_chat_db_name = await self.init_knowledge(user_id)
 
             # 获取请求参数
             payload = {**body, "model": self.valves.BASE_MODEL}
@@ -200,8 +307,11 @@ class Pipe:
             await self.transfer_userproxy_role(messages)
             # 处理消息以防止相同的角色
             await self.merge_adjacent_roles(messages)
-            # TODO
-            # self.set_system_prompt(messages)
+            # RAG用户消息
+            if messages[-1]["role"] == "user":
+                results = await self.query_collection(messages[-1]["content"], knowledges)
+                for result in results:
+                    session_buffer.memory.add_object(result)
 
             log.debug("Old message:")
             log.debug(messages[1:])
@@ -214,11 +324,19 @@ class Pipe:
             while create_new_round and round_count < self.valves.MAX_LOOP:
                 
                 # RAG队列大于阈值时等待，再继续下一轮
-                if len(session_buffer.rag_queue) > self.rag_queue_max:
-                    await asyncio.sleep(0.02)
+                if session_buffer.rag_thread_mgr.active_count() > self.rag_thread_max:
+                    await asyncio.sleep(0.1)
                     continue
 
+                # 更新系统提示词
+                self.set_system_prompt(messages, session_buffer, code_worker_op_system)
+
+                # 续写思考内容
+                if round_buffer.reasoning_content or round_buffer.total_response:
+                    self.update_assistant_message(messages, round_buffer, event_flags, prefix_reasoning=True)
+
                 log.info("Starting chat round")
+
                 async with client.stream(
                     "POST",
                     f"{self.valves.MODEL_API_BASE_URL}/chat/completions",
@@ -237,6 +355,21 @@ class Pipe:
                         if not line.startswith(self.data_prefix):
                             continue
                         #======================================================
+                        # 提前结束条件判断
+                        #======================================================
+                        # 检查rag结果队列
+                        while not session_buffer.rag_result_queue.empty():
+                            result = session_buffer.rag_result_queue.get()
+                            for result_object in result:
+                                session_buffer.memory.add_object(result_object)
+                            # TODO 更新工作记忆
+                            event_flags.mem_updated = True
+
+                        # 判断是否打断当前生成并进入下一轮
+                        if self.check_break_and_new_round(session_buffer, event_flags):
+                            break
+ 
+                        #======================================================
                         # 解析数据
                         #======================================================
                         json_str = line[len(self.data_prefix) :]
@@ -253,17 +386,25 @@ class Pipe:
                             return
 
                         choice = data.get("choices", [{}])[0]
-                        
+
+
                         #======================================================
                         # 结束条件判断
                         #======================================================
                         if choice.get("finish_reason") or event_flags.early_end_round:
                             log.info("Finishing chat")
-                            await self.finalize_sentences(session_buffer, round_buffer)
+                            self.update_assistant_message(messages, round_buffer, event_flags)
+                            paragraph = await self.finalize_sentences(session_buffer, round_buffer)
+                            if paragraph:
+                                session_buffer.rag_thread_mgr.submit(
+                                    self.query_collection_to_queue,
+                                    args=(session_buffer.rag_result_queue, [paragraph], knowledges)
+                                )
                             round_buffer.reset()
 
                             # TODO
                             create_new_round = False
+                            round_count += 1
                             break
                         #======================================================
                         # 思考状态处理
@@ -271,13 +412,10 @@ class Pipe:
                         state_output = await self.update_thinking_state(choice.get("delta", {}), event_flags)
                         if state_output:
                             yield state_output  # 直接发送状态标记
-                            if state_output == "<think>":
-                                await asyncio.sleep(0.02)
-                                yield "\n"
                         #======================================================
                         # 内容处理
                         #======================================================
-                        content = self.process_content(choice["delta"], round_buffer)
+                        content = self.process_content(choice["delta"], round_buffer, event_flags)
                         if content:
                             yield content
                             if do_semantic_segmentation:
@@ -290,32 +428,43 @@ class Pipe:
                                     continue
                                 # 实时RAG搜索
                                 if self.valves.REALTIME_RAG:
-                                    session_buffer.rag_queue.extend(new_paragraphs)
-
-                        # 判断是否打断当前生成并进入下一轮
-                        if self.check_break_and_new_round(session_buffer, event_flags):
-                            break
-                      
-                log.debug(messages[-1:])
-                round_count += 1
+                                    for paragraph in new_paragraphs:
+                                        session_buffer.rag_thread_mgr.submit(
+                                            self.query_collection_to_queue,
+                                            args=(session_buffer.rag_result_queue, [paragraph], knowledges)
+                                        )
+                     
 
         except Exception as e:
-            err_type = type(e).__name__
-            yield json.dumps({"error": f"{err_type}: {str(e)}"}, ensure_ascii=False)
+            yield self._format_error("Exception", str(e))
+
+    def _format_error(self, status_code: int, error: bytes) -> str:
+        # 如果 error 已经是字符串，则无需 decode
+        if isinstance(error, str):
+            error_str = error
+        else:
+            error_str = error.decode(errors="ignore")
+
+        try:
+            err_msg = json.loads(error_str).get("message", error_str)[:200]
+        except Exception as e:
+            err_msg = error_str[:200]
+        return json.dumps(
+            {"error": f"HTTP {status_code}: {err_msg}"}, ensure_ascii=False
+        )
 
     def check_break_and_new_round(self, session_buffer: SessionBuffer, event_flags: EventFlags):
-        log.debug("Checking break and new round")
         if_break = False
         # 工作记忆更新时打断
         if event_flags.mem_updated:
-            break_flag = True
-        # RAG队列长度超过阈值时打断
-        if len(session_buffer.rag_queue) > self.rag_queue_max:
-            break_flag = True
-        # Cleanup
-        if if_break:
-            log.info("Breaking chat round and resetting flags")
+            log.info("Breaking chat round: Memory updated")
+            if_break = True
             event_flags.mem_updated = False
+        # RAG队列长度超过阈值时打断
+        if session_buffer.rag_thread_mgr.active_count() > self.rag_thread_max:
+            log.info(f"Breaking chat round: RAG thread count {session_buffer.rag_thread_mgr.active_count()}")
+            if_break = True
+
         return if_break
             
 
@@ -351,7 +500,7 @@ class Pipe:
             for knowledge in knowledge_bases:
                 knowledge_name = knowledge.name  # 获取知识库名称
                 if knowledge_name in rag_collection_names or knowledge_name == long_chat_db_name:
-                    log.info(f"Adding knowledge base: {knowledge_name}")
+                    log.info(f"Adding knowledge base: {knowledge_name} ({knowledge.id})")
                     knowledges[knowledge_name] = (
                         knowledge  # 将知识库信息存储到字典中
                     )
@@ -362,7 +511,7 @@ class Pipe:
                 )
                 form_data = KnowledgeForm(
                     name=long_chat_db_name,
-                    description=f"Long term memory for ${self.model_id}",
+                    description=f"Long term memory for {self.model_id}",
                     access_control={},
                 )
                 knowledges[long_chat_db_name] = (
@@ -452,33 +601,70 @@ class Pipe:
             i += 1
 
     async def update_thinking_state(self, delta: dict, event_flags: EventFlags) -> str:
-        """更新思考状态"""
+        """
+        更新思考状态
+        0: 未开始 / 回答中
+        1: resasoning_content
+        2: content为思考，process content时放入reasoning_content，并等待</think>
+        3: </think>
+        4: '\n\n'
+        ---
+        rc 0 -> 1  <think>\n\n
+        rc 1
+        content 1 -> 0 \n</think>\n\n
+        ---
+        rc 0 -> 1
+        content ... 2 
+        content '</think>' 2 -> 3
+        content '\n\n' 3-> 4
+        content ... 4 -> 0
+        ---
+        """
         state_output = ""
 
-        # 状态转换：未开始 -> 思考中
-        if event_flags.thinking_state == -1 and delta.get("reasoning_content"):
-            event_flags.thinking_state = 0
-            state_output = "<think>"
+        #log.debug(f"Thinking state old: {event_flags.thinking_state}, delta: {delta}")
 
-        # 状态转换：思考中 -> 已回答
-        elif (
-            event_flags.thinking_state == 0
-            and not delta.get("reasoning_content")
-            and delta.get("content")
-        ):
+        # 状态转换：未开始 -> 思考中
+        if event_flags.thinking_state == 0 and delta.get("reasoning_content"):
+            # 0 -> 1
             event_flags.thinking_state = 1
+            state_output = "<think>\n\n"
+        elif event_flags.thinking_state == 1 and delta.get("content"):
+            # 1 -> 0
+            event_flags.thinking_state = 0
             state_output = "\n</think>\n\n"
+        elif event_flags.thinking_state == 2 and delta.get("content") == "</think>":
+            # 2 -> 3
+            event_flags.thinking_state = 3
+            state_output = "\n</think>\n\n"
+        elif event_flags.thinking_state == 3 and delta.get("content") == "\n\n":
+            # 3 -> 4
+            event_flags.thinking_state = 4
+        elif event_flags.thinking_state == 4 and delta.get("content"):
+            # 4 -> 0
+            event_flags.thinking_state = 0
+
+        #log.debug(f"Thinking state new: {event_flags.thinking_state}")
 
         return state_output
 
-    def process_content(self, delta: dict, round_buffer: RoundBuffer) -> str:
+    def process_content(self, delta: dict, round_buffer: RoundBuffer, event_flags: EventFlags) -> str:
         """直接返回处理后的内容"""
         if delta.get("reasoning_content", ""):
-            return delta.get("reasoning_content", "")
+            reasoning_content = delta.get("reasoning_content", "")
+            round_buffer.reasoning_content += reasoning_content
+            return reasoning_content
         elif delta.get("content", ""):
             delta = delta.get("content", "")
-            round_buffer.total_response += delta
-            return delta
+            if event_flags.thinking_state == 0:
+                # 回答状态时才放入回答
+                round_buffer.total_response += delta
+                return delta
+            elif event_flags.thinking_state == 2:
+                # 思考状态时放入思考内容
+                round_buffer.reasoning_content += delta
+                return delta
+        return ""
 
     async def update_sentence_buffer(self, text, round_buffer: RoundBuffer) -> int:
         """
@@ -492,9 +678,9 @@ class Pipe:
         if len(splits) > 1:
             sentence_len_old = len(round_buffer.sentences)
             for i in range(len(splits) - 1):
-                mark_pattern = r"^[\s\W_]+$"  # 纯符号
+                mark_pattern = r"^[\s\W_]+$"
                 if (
-                    re.match(mark_pattern, splits[i].strip())
+                    re.match(mark_pattern, splits[i].strip())  # 纯符号
                     and len(round_buffer.sentences) > 0
                 ):
                     round_buffer.sentences[-1] += splits[i]
@@ -505,8 +691,41 @@ class Pipe:
             return sentence_len_new - sentence_len_old
         return 0
 
-    # RAG
+    def update_assistant_message(self, messages, round_buffer, event_flags: EventFlags, prefix_reasoning: bool=False):
+        """更新助手消息"""
+        if prefix_reasoning:
+            if round_buffer.total_response:
+                assistante_message = {
+                    "role": "assistant",
+                    "content": f"<think>\n\n{round_buffer.reasoning_content}\n</think>\n\n{round_buffer.total_response}",
+                    "prefix": True
+                }
+            else:
+                assistante_message = {
+                    "role": "assistant",
+                    "content": f"<think>\n\n{round_buffer.reasoning_content}",
+                    "prefix": True
+                }
+                event_flags.thinking_state = 2
+        else:
+            if not round_buffer.total_response:
+                log.error("No total_response, cannot update assistant message?")
+                return
 
+            assistante_message = {
+                "role": "assistant",
+                "content": round_buffer.total_response,
+                "prefix": True
+            }
+
+        if messages[-1]["role"] == "assistant":
+            messages[-1] = assistante_message
+        else:
+            messages.append(assistante_message)
+
+        log.debug(messages)
+
+    # RAG
     def clean_text(self, text):
         # 去除emoji，避免embedding报错
         emoji_pattern = re.compile(
@@ -520,29 +739,28 @@ class Pipe:
         )
         return emoji_pattern.sub(r"", text)  # no emoji
 
-    async def get_single_embedding(self, text):
+    async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """调用API获取文本嵌入"""
-        headers = {"Authorization": f"Bearer {self.valves.MODEL_API_KEY}"}
-        response = requests.post(
-            f"{self.valves.MODEL_API_BASE_URL}/embeddings",
-            headers=headers,
-            json={
-                "model": self.valves.EMBEDDING_MODEL,
-                "input": [self.clean_text(text)],
-            },
-        )
-        if response.status_code != 200:
-            raise Exception(f"API Error: {response.status_code} - {response.text}")
-
-        data = response.json()
-
-        if "data" in data:
-            try:
-                return data["data"][0]["embedding"]
-            except Exception as e:
-                raise ValueError(f"Error extracting 'embedding' from response: {e}")
-        else:
-            raise ValueError("Response from Embedding API did not contain 'data'.")
+        headers = {"Authorization": f"Bearer {self.valves.EMBEDDING_API_KEY}"}
+        try:
+            embeddings = []
+            response = requests.post(
+                f"{self.valves.EMBEDDING_API_BASE_URL}/embeddings",
+                headers=headers,
+                json={
+                    "model": self.valves.EMBEDDING_MODEL,
+                    "input": [self.clean_text(text) for text in texts],
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            for item in data["data"]:
+                if not "embedding" in item:
+                    continue
+                embeddings.append(item["embedding"])
+        except Exception as e:
+            log.error(f"Failed to get embedding for text: {text}\nError: {e}")
+        return embeddings
 
     def cosine_similarity(self, a, b):
         """计算余弦相似度"""
@@ -573,7 +791,12 @@ class Pipe:
             if window.strip() == "":
                 continue
 
-            round_buffer.window_embeddings.append(await self.get_single_embedding(window))
+            embeddings = await self.get_embeddings([window])
+            if len(embeddings) == 0:
+                log.warning(f"Failed to get embedding for window: {window}")
+                continue
+
+            round_buffer.window_embeddings.append(embeddings[0])
             if len(round_buffer.window_embeddings) > 1:
                 similarity = self.cosine_similarity(
                     round_buffer.window_embeddings[-2], round_buffer.window_embeddings[-1]
@@ -590,20 +813,20 @@ class Pipe:
 
         return new_paragraphs
 
-    async def finalize_sentences(self, session_buffer: SessionBuffer, round_buffer: RoundBuffer) -> int:
+    async def finalize_sentences(self, session_buffer: SessionBuffer, round_buffer: RoundBuffer) -> str:
         """
         将缓冲区中的文本添加到句子列表中。
         :param session_buffer: 会话缓冲区
         :param round_buffer: 轮次缓冲区
-        :return: 添加到句子列表的句子数量
+        :return: paragraph
         """
         log.debug("Finalizing sentences")
         sentence_n = 0
         if round_buffer.sentence_buffer:
             sentence_len_old = len(round_buffer.sentences)
-            mark_pattern = r"^[\s\W_]+$"  # 纯符号
+            mark_pattern = r"^[\s\W_]+$"
             if (
-                re.match(mark_pattern, round_buffer.sentence_buffer.strip())
+                re.match(mark_pattern, round_buffer.sentence_buffer.strip())   # 纯符号
                 and len(round_buffer.sentences) > 0
             ):
                 round_buffer.sentences[-1] += round_buffer.sentence_buffer
@@ -616,82 +839,114 @@ class Pipe:
             paragraph = "".join(
                 round_buffer.sentences[round_buffer.paragraph_begin_id:]
             )
-            session_buffer.rag_queue.append(paragraph)
-            log.debug(
-                f"Add rag queue:\n {paragraph}"
-            )
-            # TODO: submit async rag
-            session_buffer.rag_queue.pop()
+            return paragraph
+        return ""
     
-    async def point_search_vector_db_file(file_name, embedding, top_k, max_distance):
-        log.debug("Searching Vector DB")
-        result = VECTOR_DB_CLIENT.search(
-            collection_name=file_name,
-            vectors=[embedding],
-            limit=top_k,
-        )
-        # sanity check
-        if not result:
-            return []
-
-        if not all(
-            hasattr(result, attr)
-            for attr in ["ids", "distances", "documents", "metadatas"]
-        ):
-            return []
-
-        if (
-            not result.ids
-            or not result.distances
-            or not result.documents
-            or not result.metadatas
-        ):
-            return []
-
+    async def search_chroma_db(self, collection_id, embeddings: List, top_k: int, max_distance: float):
+        """
+        Search Chroma DB
+        """
         result_objects = []
+        try:
+            if not collection_id in VECTOR_DB_CLIENT.client.list_collections():
+                log.warning(f"Collection {collection_id} not found in Vector DB, maybe this is an empty collection.")
+                return result_objects
 
-        for i in range(len(result.ids)):
-            if result.distances[i] > max_distance:
-                continue
-            result_objects.append(
-                VectorDBResultObject(
-                    id_=result.ids[i],
-                    distance=result.distances[i],
-                    document=result.documents[i],
-                    metadata=result.metadatas[i],
-                    query_embedding=embedding,
-                )
+            results = VECTOR_DB_CLIENT.search(
+                collection_name=collection_id,
+                vectors=embeddings,
+                limit=top_k,
             )
+
+            if not results:
+                return result_objects
+
+            for query_i in range(len(embeddings)):
+                for k in range(len(results.ids[query_i])):
+                    if results.distances[query_i][k] > max_distance:
+                        continue
+                    result_objects.append(
+                        VectorDBResultObject(
+                            id_=results.ids[query_i][k],
+                            distance=results.distances[query_i][k],
+                            document=results.documents[query_i][k],
+                            metadata=results.metadatas[query_i][k],
+                            query_embedding=embeddings[query_i],
+                        )
+                    )
+
+        except Exception as e:
+            log.error(f"Error searching vector db: {e}")
 
         return result_objects
 
     async def query_collection(
-            self, query_keywords: str, knowledges: Dict[str, Knowledges], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0.5
+            self, query_keywords: List[str], knowledges: Dict[str, Knowledges], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0.5
     ) -> list:
-        log.debug("Querying Collection")
-        embeddings = None
-        query_keywords = query_keyworsd.strip()
+        log.debug("Querying Knowledge Collection")
+        embeddings = []
+        query_keywords = [kwd.strip() for kwd in query_keywords]
         # Generate query embedding
         log.debug(f"Generating Embeddings")
-        query_embedding = await self.get_single_embedding(query_keywords)
-        # Get knowledge object
-        if len(knowledge_names) == 0:
-            knowledge_names = knowledges.keys()
-        file_names = []
-        for knowledge_name in knowledge_names:
-            knowledge = knowledges[knowledge_name]
-            file_names.extend(["file-" + file_id for file_id in knowledge.data["file_ids"]])
-        # Parallel search for files
-        log.debug(f"Searching {len(file_names)} files in Knowledges: {knowledge_names}")
-        tasks = [point_search_vector_db_file(file_name, query_embedding, top_k, max_distance) for file_name in file_names]
-        results = await asyncio.gather(*tasks)
-        # flatten
-        all_results = [result for sublist in results for result in sublist]
-        # sort by distance
-        all_results.sort(key=lambda x: x.distance)
-        top_results = all_results[:top_k]
+        try:
+            query_embeddings = await self.get_embeddings(query_keywords)
+            if len(query_embeddings) == 0:
+                log.warning(f"Failed to get embedding for queries: {query_keywords}")
+                return []
+            # Get knowledge object
+            if len(knowledge_names) == 0:
+                knowledge_names = knowledges.keys()
 
-        return top_results
+            # Search for each knowledge
+            all_results = []
+            for knowledge_name in knowledge_names:
+                knowledge = knowledges[knowledge_name]
+                if not knowledge or not knowledge.data:
+                    continue
+                collection_id = knowledge.id
+                log.debug(f"Searching collection: {knowledge_name}")
+                results = await self.search_chroma_db(collection_id, query_embeddings, top_k, max_distance)
+                if not results:
+                    continue
+                all_results.extend(results)
+
+            log.debug(f"Search done with {len(all_results)} results")
+
+            return all_results
+
+        except Exception as e:
+            log.error(f"Error querying collection: {e}")
+
+        return []
+
+    def query_collection_to_queue(self, result_queue: Queue, query_keywords: List[str], knowledges: Dict[str, Knowledges], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0.5):
+        try:
+            results = asyncio.run(self.query_collection(query_keywords, knowledges, knowledge_names, top_k, max_distance))
+            if results:
+                log.debug(f"Put into results")
+                result_queue.put(results)
+        except Exception as e:
+            log.error(f"Error querying collection to queue: {e}")
+
+    def set_system_prompt(self, messages, session_buffer: SessionBuffer, op_system: str):
+        # Working memory
+        wm_template = "## Context\n\n{{WORKING_MEMORY}}---\n"
+
+        # Create a Jinja2 Template object
+        template = Template(wm_template)
+        current_date = datetime.now()
+        formatted_date = current_date.strftime("%Y-%m-%d")
+
+        # Render the template with a list of items
+        context = {"CURRENT_DATE": formatted_date, "OP_SYSTEM": op_system, "WORKING_MEMORY": str(session_buffer.memory)}
+        result = template.render(**context)
+
+        # Set system_prompt
+        if messages[0]["role"] == "system":
+            messages[0]["content"] = result
+        else:
+            context_message = {"role": "system", "content": result}
+            messages.insert(0, context_message)
 
     def DEFAULT_CODE_INTERFACE_PROMPT(self):
         return ""
