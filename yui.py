@@ -145,7 +145,7 @@ class WorkingMemory:
     def __str__(self):
         output = ""
         for obj in self.objects:
-            log.debug(obj.metadata)
+            log.debug(f"Result Document: {obj.document}\nDistance: {obj.distance}\nMetadata: {obj.metadata}")
             source = obj.metadata.get("source", "Unknown").replace("~", "/")
             output += f"<context source=\"{source}\">\n{obj.document}\n</context>\n\n"
         return output
@@ -195,6 +195,10 @@ class Pipe:
             default="deepseek-ai/deepseek-r1:671b",
             description="对话的模型名称",
         )
+        TASK_MODEL: str = Field(
+            default="deepseek-ai/deepseek-v3:671b",
+            description="用于提取搜索提示词等的模型名称",
+        )
         EMBEDDING_API_BASE_URL: str = Field(
             default="http://127.0.0.1:11434/v1",
             description="文本嵌入API的基础请求地址",
@@ -206,6 +210,7 @@ class Pipe:
         )
         # RAG配置
         REALTIME_RAG: bool = Field(default=True, description="Realtime seaching Vector DB")
+        GENERATE_KEYWORDS_FROM_MODEL: bool = Field(default=True, description="Generate keywords from model")
         RAG_COLLECTION_NAMES: str = Field(default="Yui-000-Source, DarkSHINE_Simulation_Software")
         EMBEDDING_BATCH_SIZE: int = Field(
             default=2000,
@@ -282,9 +287,6 @@ class Pipe:
             code_worker = None
             code_worker_op_system = "Linux"
 
-            if self.valves.REALTIME_RAG or self.valves.REALTIME_IO:
-                do_semantic_segmentation = True
-
             if self.valves.USE_CODE_INTERFACE:
                 TOOL["code_interface"] = self._code_interface
                 prompt_templates["code_interface"] = (
@@ -308,6 +310,8 @@ class Pipe:
             await self.transfer_userproxy_role(messages)
             # 处理消息以防止相同的角色
             await self.merge_adjacent_roles(messages)
+            # 更新系统提示词
+            self.set_system_prompt(messages, session_buffer, code_worker_op_system)
             # RAG用户消息
             if messages[-1]["role"] == "user":
                 results = await self.query_collection(messages[-1]["content"], knowledges)
@@ -332,10 +336,7 @@ class Pipe:
                 # 更新系统提示词
                 self.set_system_prompt(messages, session_buffer, code_worker_op_system)
 
-                # 续写思考内容
-                if round_buffer.reasoning_content or round_buffer.total_response:
-                    self.update_assistant_message(messages, round_buffer, event_flags, prefix_reasoning=True)
-
+                log.debug(messages[1:])
                 log.info("Starting chat round")
 
                 async with client.stream(
@@ -394,7 +395,7 @@ class Pipe:
                         #======================================================
                         if choice.get("finish_reason") or event_flags.early_end_round:
                             log.info("Finishing chat")
-                            self.update_assistant_message(messages, round_buffer, event_flags)
+                            self.update_assistant_message(messages, round_buffer, event_flags, prefix_reasoning=False)
                             paragraph = await self.finalize_sentences(session_buffer, round_buffer)
                             if paragraph:
                                 session_buffer.rag_thread_mgr.submit(
@@ -413,12 +414,20 @@ class Pipe:
                         state_output = await self.update_thinking_state(choice.get("delta", {}), event_flags)
                         if state_output:
                             yield state_output  # 直接发送状态标记
+
+                        do_semantic_segmentation = False
+                        if self.valves.REALTIME_RAG:
+                            do_semantic_segmentation = True
+                        if self.valves.REALTIME_IO and self.is_answering(event_flags.thinking_state):
+                            do_semantic_segmentation = True
                         #======================================================
                         # 内容处理
                         #======================================================
                         content = self.process_content(choice["delta"], round_buffer, event_flags)
                         if content:
                             yield content
+                            self.update_assistant_message(messages, round_buffer, event_flags, prefix_reasoning=True)
+
                             if do_semantic_segmentation:
                                 # 根据语义分割段落
                                 sentence_n = await self.update_sentence_buffer(content, round_buffer)
@@ -428,14 +437,13 @@ class Pipe:
                                 if len(new_paragraphs) == 0:
                                     continue
                                 # 实时RAG搜索
-                                if self.valves.REALTIME_RAG:
-                                    for paragraph in new_paragraphs:
-                                        session_buffer.rag_thread_mgr.submit(
-                                            self.query_collection_to_queue,
-                                            args=(session_buffer.rag_result_queue, [paragraph], knowledges)
-                                        )
+                                for paragraph in new_paragraphs:
+                                    session_buffer.rag_thread_mgr.submit(
+                                        self.query_collection_to_queue,
+                                        args=(session_buffer.rag_result_queue, [paragraph], knowledges)
+                                    )
                      
-
+                log.debug(messages[1:])
         except Exception as e:
             yield self._format_error("Exception", str(e))
 
@@ -601,6 +609,12 @@ class Pipe:
                 messages.pop(i + 1)
             i += 1
 
+    def is_thinking(self, thinking_state):
+        return thinking_state in [1, 2]
+
+    def is_answering(self, thinking_state):
+        return thinking_state == 0
+
     async def update_thinking_state(self, delta: dict, event_flags: EventFlags) -> str:
         """
         更新思考状态
@@ -724,8 +738,6 @@ class Pipe:
         else:
             messages.append(assistante_message)
 
-        log.debug(messages)
-
     # RAG
     def clean_text(self, text):
         # 去除emoji，避免embedding报错
@@ -742,9 +754,9 @@ class Pipe:
 
     async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """调用API获取文本嵌入"""
+        embeddings = []
         headers = {"Authorization": f"Bearer {self.valves.EMBEDDING_API_KEY}"}
         try:
-            embeddings = []
             response = requests.post(
                 f"{self.valves.EMBEDDING_API_BASE_URL}/embeddings",
                 headers=headers,
@@ -864,7 +876,7 @@ class Pipe:
 
             for query_i in range(len(embeddings)):
                 for k in range(len(results.ids[query_i])):
-                    if results.distances[query_i][k] > max_distance:
+                    if (max_distance > 0) and (results.distances[query_i][k] > max_distance):
                         continue
                     result_objects.append(
                         VectorDBResultObject(
@@ -882,11 +894,15 @@ class Pipe:
         return result_objects
 
     async def query_collection(
-            self, query_keywords: List[str], knowledges: Dict[str, Knowledges], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0.5
-    ) -> list:
+            self, query_keywords: List[str], knowledges: Dict[str, Knowledges], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0 ) -> list:
         log.debug("Querying Knowledge Collection")
         embeddings = []
+        if self.valves.GENERATE_KEYWORDS_FROM_MODEL:
+            query_keywords = await self.generate_query_keywords(query_keywords)
         query_keywords = [kwd.strip() for kwd in query_keywords]
+        if len(query_keywords) == 0:
+            log.warning("No keywords to query")
+            return []
         # Generate query embedding
         log.debug(f"Generating Embeddings")
         try:
@@ -920,7 +936,7 @@ class Pipe:
 
         return []
 
-    def query_collection_to_queue(self, result_queue: Queue, query_keywords: List[str], knowledges: Dict[str, Knowledges], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0.5):
+    def query_collection_to_queue(self, result_queue: Queue, query_keywords: List[str], knowledges: Dict[str, Knowledges], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0.0):
         try:
             results = asyncio.run(self.query_collection(query_keywords, knowledges, knowledge_names, top_k, max_distance))
             if results:
@@ -928,6 +944,72 @@ class Pipe:
                 result_queue.put(results)
         except Exception as e:
             log.error(f"Error querying collection to queue: {e}")
+
+    def extract_json(self, content):
+        # 匹配 ```json 块中的 JSON
+        json_block_pattern = r'```json\s*({.*?})\s*```'
+        # 匹配 ``` 块中的 JSON
+        block_pattern = r'```\s*({.*?})\s*```'
+        log.debug(f"Content: {content}")
+        try:
+            # 尝试匹配 ```json 块
+            match = re.search(json_block_pattern, content, re.DOTALL)
+            if match:
+                return json.loads(match.group(1))
+    
+            # 尝试匹配 ``` 块
+            match = re.search(block_pattern, content, re.DOTALL)
+            if match:
+                return json.loads(match.group(1))
+    
+            # 尝试直接转换
+            return json.loads(content)
+        except Exception as e:
+            log.error(f"Failed to extract JSON: {e}")
+    
+        return None
+
+    async def generate_query_keywords(self, contexts: List):
+        """
+        Generate query keywords using llm
+        """
+        query_template = self.DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE()
+
+        # Create a Jinja2 Template object
+        template = Template(query_template)
+        current_date = datetime.now()
+        formatted_date = current_date.strftime("%Y-%m-%d")
+        #if len(messages) > 7:
+        #    short_messages = [messages[0]] + messages[-6:]
+        #else:
+        #    short_messages = messages
+        
+        # Render the template with a list of items
+        replace = {"CURRENT_DATE": formatted_date, "CONTEXTS": contexts}
+        query_prompt = template.render(**replace)
+        task_messages = [{"role": "user", "content": query_prompt}]
+        headers = {"Authorization": f"Bearer {self.valves.MODEL_API_KEY}"}
+        payload = {
+            "model":  self.valves.TASK_MODEL,
+            "messages": task_messages,
+        }
+        keywords = []
+        try:
+            response = requests.post(
+                f"{self.valves.MODEL_API_BASE_URL}/chat/completions",
+                headers=headers,
+                json=payload,
+                stream=False,
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = data.get("choices", [{}])[0]["message"]["content"]
+            result_json = self.extract_json(content)
+            keywords = result_json.get("queries", [])
+        except Exception as e:
+            log.error(f"Failed to generate query keywords: {e}")
+        log.debug(f"Generated query keywords: {keywords}")
+        return keywords
 
     def set_system_prompt(self, messages, session_buffer: SessionBuffer, op_system: str):
         # Working memory
@@ -955,3 +1037,27 @@ class Pipe:
     def DEFAULT_WEB_SEARCH_PROMPT(self):
         return ""
 
+    def DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE(self):
+        return """### Task:
+Analyze the context to determine the necessity of generating search queries, in the given language. By default, **prioritize generating 1-3 broad and relevant search queries** unless it is absolutely certain that no additional information is required. The aim is to retrieve comprehensive, updated, and valuable information even with minimal uncertainty. If no search is unequivocally needed, return an empty list.
+
+### Guidelines:
+- Respond **EXCLUSIVELY** with a JSON object. Any form of extra commentary, explanation, or additional text is strictly prohibited.
+- When generating search queries, respond in the format: { "queries": ["query1", "query2"] }, ensuring each query is distinct, concise, and relevant to the topic.
+- If and only if it is entirely certain that no useful results can be retrieved by a search, return: { "queries": [] }.
+- Err on the side of suggesting search queries if there is **any chance** they might provide useful or updated information.
+- Be concise and focused on composing high-quality search queries, avoiding unnecessary elaboration, commentary, or assumptions.
+- Today's date is: {{CURRENT_DATE}}.
+- Always prioritize providing actionable and broad queries that maximize informational coverage.
+
+### Output:
+Strictly return in JSON format: 
+{
+  "queries": ["query1", "query2"]
+}
+
+### Contexts
+{% for item in CONTEXTS %}
+{{ item }}
+{% endfor %}
+"""
