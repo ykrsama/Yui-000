@@ -164,6 +164,7 @@ class SessionBuffer:
         self.rag_thread_mgr: ThreadManager = ThreadManager()
         self.rag_result_queue: Queue = Queue()
         self.memory: WorkingMemory = WorkingMemory(chat_id)
+        self.chat_history: str = ""
         # TODO: Sensor
 
 class RoundBuffer:
@@ -190,7 +191,7 @@ class Pipe:
             default="https://aiapi001.ihep.ac.cn/apiv2",
             description="语言模型API的基础请求地址",
         )
-        MODEL_API_KEY: str = Field(default="", description="用于身份验证的API密钥")
+        MODEL_API_KEY: str = Field(default="api key here", description="用于身份验证的API密钥")
         BASE_MODEL: str = Field(
             default="deepseek-ai/deepseek-r1:671b",
             description="对话的模型名称",
@@ -203,7 +204,7 @@ class Pipe:
             default="http://127.0.0.1:11434/v1",
             description="文本嵌入API的基础请求地址",
         )
-        EMBEDDING_API_KEY: str = Field(default="", description="用于身份验证的API密钥")
+        EMBEDDING_API_KEY: str = Field(default="api key here", description="用于身份验证的API密钥")
         EMBEDDING_MODEL: str = Field(
             default="bge-m3:latest",
             description="用于获取文本嵌入的模型名称",
@@ -225,8 +226,8 @@ class Pipe:
         USE_CODE_INTERFACE: bool = Field(default=False)
         USE_MAPPING: bool = Field(default=False)
         USE_WEB_SEARCH: bool = Field(default=False)
-        GOOGLE_PSE_API_KEY: str = Field(default="", title="Google PSE API Key")
-        GOOGLE_PSE_ENGINE_ID: str = Field(default="", title="Google PSE Engine ID")
+        GOOGLE_PSE_API_KEY: str = Field(default="api key here", title="Google PSE API Key")
+        GOOGLE_PSE_ENGINE_ID: str = Field(default="id here", title="Google PSE Engine ID")
         # 其他配置
         MAX_LOOP: int = Field(
             default=20, description="Prevent dead loop, 0 for unlimited."
@@ -268,12 +269,12 @@ class Pipe:
             # 获取chat id, user id, message id
             user_id, chat_id, message_id = self.extract_event_info(__event_emitter__)
 
+            # 初始化知识库
+            collection_ids = await self.init_knowledge(user_id, chat_id)
+
             event_flags: EventFlags = EventFlags()
             session_buffer: SessionBuffer = SessionBuffer(chat_id)
             round_buffer: RoundBuffer = RoundBuffer()
-
-            # 初始化知识库
-            knowledges, long_chat_db_name = await self.init_knowledge(user_id)
 
             # Initialize client
             client = httpx.AsyncClient(
@@ -314,7 +315,7 @@ class Pipe:
             self.set_system_prompt(messages, session_buffer, code_worker_op_system)
             # RAG用户消息
             if messages[-1]["role"] == "user":
-                results = await self.query_collection(messages[-1]["content"], knowledges)
+                results = await self.query_collection(messages[-1]["content"], collection_ids)
                 for result in results:
                     session_buffer.memory.add_object(result)
 
@@ -400,7 +401,7 @@ class Pipe:
                             if paragraph:
                                 session_buffer.rag_thread_mgr.submit(
                                     self.query_collection_to_queue,
-                                    args=(session_buffer.rag_result_queue, [paragraph], knowledges)
+                                    args=(session_buffer.rag_result_queue, [paragraph], collection_ids)
                                 )
                             round_buffer.reset()
 
@@ -440,7 +441,7 @@ class Pipe:
                                 for paragraph in new_paragraphs:
                                     session_buffer.rag_thread_mgr.submit(
                                         self.query_collection_to_queue,
-                                        args=(session_buffer.rag_result_queue, [paragraph], knowledges)
+                                        args=(session_buffer.rag_result_queue, [paragraph], collection_ids)
                                     )
                      
                 log.debug(messages[1:])
@@ -490,16 +491,18 @@ class Pipe:
                 message_id = request_info.get("message_id")
         return user_id, chat_id, message_id
 
-    async def init_knowledge(self, user_id: str) -> Tuple[Dict, str]:
+    async def init_knowledge(self, user_id: str, chat_id: str) -> Dict:
         """
-        初始化知识库数据，将其存储在 knowledges 字典中。
+        初始化知识库数据，将其存储在 collection_ids 字典中。
         :param user_id: 用户ID
-        :return: 知识库字典和长期记忆库名称
+        :return: 知识库字典和消息记录文件名称
         """
         log.debug("Initializing knowledge bases")
-        knowledges: Dict[str, Knowledges] = {}  # 初始化知识库字典
+        collection_ids: Dict[str, str] = {}  # 初始化知识库字典
         try:
-            long_chat_db_name = f"{self.model_id}-LTM-{user_id}"  # 长期记忆
+            long_chat_collection_name = f"{self.model_id}-Chat-History-{user_id}"
+            long_chat_file_name = f"chat-{self.model_id}-{user_id}-{chat_id}.txt"
+            long_chat_knowledge = None
             knowledge_bases = Knowledges.get_knowledge_bases_by_user_id(
                 user_id, "read"
             )  # 获取知识库
@@ -508,33 +511,37 @@ class Pipe:
             # 遍历知识库列表
             for knowledge in knowledge_bases:
                 knowledge_name = knowledge.name  # 获取知识库名称
-                if knowledge_name in rag_collection_names or knowledge_name == long_chat_db_name:
+                if knowledge_name in rag_collection_names:
                     log.info(f"Adding knowledge base: {knowledge_name} ({knowledge.id})")
-                    knowledges[knowledge_name] = (
-                        knowledge  # 将知识库信息存储到字典中
+                    collection_ids[knowledge_name] = (
+                        knowledge.id # 将知识库信息存储到字典中
                     )
-
-            if not long_chat_db_name in knowledges:
+                if knowledge_name == long_chat_collection_name:
+                    long_chat_knowledge = knowledge
+                  
+            if not long_chat_knowledge:
                 log.info(
-                    f"Creating long term memory knowledge base: {long_chat_db_name}"
+                    f"Creating long term memory knowledge base: {long_chat_collection_name}"
                 )
                 form_data = KnowledgeForm(
-                    name=long_chat_db_name,
-                    description=f"Long term memory for {self.model_id}",
+                    name=long_chat_collection_name,
+                    description=f"Chat history for {self.model_id}",
                     access_control={},
                 )
-                knowledges[long_chat_db_name] = (
-                    Knowledges.insert_new_knowledge(user_id, form_data)
-                )
+                long_chat_knowledge = Knowledges.insert_new_knowledge(user_id, form_data)
 
             log.info(
-                f"Loaded {len(knowledges)} knowledge bases: {list(knowledges.keys())}"
+                f"Loaded {len(collection_ids)} knowledge bases: {list(collection_ids.keys())}"
             )
+ 
+            # Test here:
+            # - add a file with name and id: `long_chat_file_name` to open-webui files, with a content of "Hello, World!"
+            # - add this file to the knowledge base `long_chat_knowledge`
 
         except Exception as e:
             raise Exception(f"Failed to initialize knowledge bases: {str(e)}")
 
-        return knowledges, long_chat_db_name
+        return collection_ids
 
     async def process_message_figures(self):
         pass
@@ -894,7 +901,7 @@ class Pipe:
         return result_objects
 
     async def query_collection(
-            self, query_keywords: List[str], knowledges: Dict[str, Knowledges], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0 ) -> list:
+            self, query_keywords: List[str], collection_ids: Dict[str, str], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0 ) -> list:
         log.debug("Querying Knowledge Collection")
         embeddings = []
         if self.valves.GENERATE_KEYWORDS_FROM_MODEL:
@@ -912,15 +919,12 @@ class Pipe:
                 return []
             # Get knowledge object
             if len(knowledge_names) == 0:
-                knowledge_names = knowledges.keys()
+                knowledge_names = collection_ids.keys()
 
             # Search for each knowledge
             all_results = []
             for knowledge_name in knowledge_names:
-                knowledge = knowledges[knowledge_name]
-                if not knowledge or not knowledge.data:
-                    continue
-                collection_id = knowledge.id
+                collection_id = collection_ids[knowledge_name]
                 log.debug(f"Searching collection: {knowledge_name}")
                 results = await self.search_chroma_db(collection_id, query_embeddings, top_k, max_distance)
                 if not results:
@@ -936,9 +940,9 @@ class Pipe:
 
         return []
 
-    def query_collection_to_queue(self, result_queue: Queue, query_keywords: List[str], knowledges: Dict[str, Knowledges], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0.0):
+    def query_collection_to_queue(self, result_queue: Queue, query_keywords: List[str], collection_ids: Dict[str, str], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0.0):
         try:
-            results = asyncio.run(self.query_collection(query_keywords, knowledges, knowledge_names, top_k, max_distance))
+            results = asyncio.run(self.query_collection(query_keywords, collection_ids, knowledge_names, top_k, max_distance))
             if results:
                 log.debug(f"Put into results")
                 result_queue.put(results)
