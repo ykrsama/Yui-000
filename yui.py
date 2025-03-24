@@ -233,7 +233,7 @@ class Pipe:
         GENERATE_KEYWORDS_FROM_MODEL: bool = Field(
             default=True, description="Generate keywords from model"
         )
-        RAG_COLLECTION_NAMES: str = Field(default="Yui-000-Source, Open WebUI Models")
+        RAG_COLLECTION_NAMES: str = Field(default="Yui-000-Source, Open WebUI Models, Open WebUI Routers")
         EMBEDDING_BATCH_SIZE: int = Field(
             default=2000,
             description="Batch size for RAG",
@@ -999,7 +999,11 @@ class Pipe:
         log.debug("Querying Knowledge Collection")
         embeddings = []
         if self.valves.GENERATE_KEYWORDS_FROM_MODEL:
-            query_keywords = await self.generate_query_keywords(query_keywords)
+            new_keywords = await self.generate_query_keywords(query_keywords)
+            if new_keywords:
+                query_keywords = new_keywords
+            else:
+                log.warning("Fall back to original keywords")
         query_keywords = [kwd.strip() for kwd in query_keywords]
         if len(query_keywords) == 0:
             log.warning("No keywords to query")
