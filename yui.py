@@ -38,44 +38,49 @@ from open_webui.models.knowledge import (
     KnowledgeUserResponse,
     KnowledgeUserModel,
 )
+from open_webui.models.files import Files, FileForm
 from hepai import HRModel
 import numpy as np
 
 log = logging.getLogger(__name__)
 log.setLevel("DEBUG")
 
+
 class ManagedThread(threading.Thread):
     """自定义线程类，用于在线程结束时自动从管理器移除"""
+
     def __init__(self, manager, target, args, kwargs):
         super().__init__(target=target, args=args, kwargs=kwargs)
         self.manager = manager  # 持有管理器实例的引用
 
     def run(self):
         try:
-            super().run()       # 执行目标函数
+            super().run()  # 执行目标函数
         except Exception as e:
             log.error(f"Thread error: {e}")
         finally:
             self.manager.remove_thread(self)  # 确保无论是否异常都执行移除操作
 
+
 class ThreadManager:
     """线程管理器类"""
+
     def __init__(self):
-        self.threads = []       # 存储活跃线程的容器
+        self.threads = []  # 存储活跃线程的容器
         self.lock = threading.Lock()  # 保证线程安全的锁
 
     def submit(self, target, args=(), kwargs=None):
         """提交新线程到线程池"""
         if kwargs is None:
             kwargs = {}
-            
+
         # 创建托管线程实例
         thread = ManagedThread(self, target, args, kwargs)
-        
+
         # 使用锁保证线程安全地添加线程
         with self.lock:
             self.threads.append(thread)
-        
+
         thread.start()  # 注意：先添加后启动保证移除操作有效性
 
     def remove_thread(self, thread):
@@ -89,7 +94,7 @@ class ThreadManager:
         # 复制当前线程列表避免遍历时修改
         with self.lock:
             current_threads = list(self.threads)
-            
+
         for thread in current_threads:
             thread.join()  # 等待每个线程完成
 
@@ -98,6 +103,7 @@ class ThreadManager:
         with self.lock:
             return len(self.threads)
 
+
 @dataclass
 class VectorDBResultObject:
     id_: str
@@ -105,6 +111,7 @@ class VectorDBResultObject:
     document: str
     metadata: Dict
     query_embedding: List
+
 
 class WorkingMemory:
     def __init__(self, chat_id, max_size=10):
@@ -130,13 +137,13 @@ class WorkingMemory:
         return is_new
 
     def save(self):
-        with open(self.filename, 'w') as file:
+        with open(self.filename, "w") as file:
             json.dump([asdict(obj) for obj in self.objects], file)
 
     def load(self):
         log.info("Loading working memory...")
         if os.path.exists(self.filename):
-            with open(self.filename, 'r') as file:
+            with open(self.filename, "r") as file:
                 data = json.load(file)
                 self.objects = [VectorDBResultObject(**obj) for obj in data]
         else:
@@ -145,19 +152,23 @@ class WorkingMemory:
     def __str__(self):
         output = ""
         for obj in self.objects:
-            log.debug(f"Result Document: {obj.document}\nDistance: {obj.distance}\nMetadata: {obj.metadata}")
+            log.debug(
+                f"Result Document: {obj.document}\nDistance: {obj.distance}\nMetadata: {obj.metadata}"
+            )
             source = obj.metadata.get("source", "Unknown").replace("~", "/")
-            output += f"<context source=\"{source}\">\n{obj.document}\n</context>\n\n"
+            output += f'<context source="{source}">\n{obj.document}\n</context>\n\n'
         return output
 
     def __repr__(self):
         return str(self.objects)
+
 
 class EventFlags:
     def __init__(self):
         self.thinking_state: int = 0
         self.early_end_round = False
         self.mem_updated = False
+
 
 class SessionBuffer:
     def __init__(self, chat_id):
@@ -166,6 +177,7 @@ class SessionBuffer:
         self.memory: WorkingMemory = WorkingMemory(chat_id)
         self.chat_history: str = ""
         # TODO: Sensor
+
 
 class RoundBuffer:
     def __init__(self):
@@ -184,6 +196,7 @@ class RoundBuffer:
         self.total_response = ""
         self.reasoning_content = ""
 
+
 class Pipe:
     class Valves(BaseModel):
         # 模型配置
@@ -191,7 +204,9 @@ class Pipe:
             default="https://aiapi001.ihep.ac.cn/apiv2",
             description="语言模型API的基础请求地址",
         )
-        MODEL_API_KEY: str = Field(default="api key here", description="用于身份验证的API密钥")
+        MODEL_API_KEY: str = Field(
+            default="api key here", description="用于身份验证的API密钥"
+        )
         BASE_MODEL: str = Field(
             default="deepseek-ai/deepseek-r1:671b",
             description="对话的模型名称",
@@ -204,21 +219,30 @@ class Pipe:
             default="http://127.0.0.1:11434/v1",
             description="文本嵌入API的基础请求地址",
         )
-        EMBEDDING_API_KEY: str = Field(default="api key here", description="用于身份验证的API密钥")
+        EMBEDDING_API_KEY: str = Field(
+            default="api key here", description="用于身份验证的API密钥"
+        )
         EMBEDDING_MODEL: str = Field(
             default="bge-m3:latest",
             description="用于获取文本嵌入的模型名称",
         )
         # RAG配置
-        REALTIME_RAG: bool = Field(default=True, description="Realtime seaching Vector DB")
-        GENERATE_KEYWORDS_FROM_MODEL: bool = Field(default=True, description="Generate keywords from model")
-        RAG_COLLECTION_NAMES: str = Field(default="Yui-000-Source, DarkSHINE_Simulation_Software")
+        REALTIME_RAG: bool = Field(
+            default=True, description="Realtime seaching Vector DB"
+        )
+        GENERATE_KEYWORDS_FROM_MODEL: bool = Field(
+            default=True, description="Generate keywords from model"
+        )
+        RAG_COLLECTION_NAMES: str = Field(default="Yui-000-Source, Open WebUI Models")
         EMBEDDING_BATCH_SIZE: int = Field(
             default=2000,
             description="Batch size for RAG",
         )
         # 环境交互配置
-        REALTIME_IO: bool = Field(default=True, description="Realtime Interact with environment and sense environment change")
+        REALTIME_IO: bool = Field(
+            default=True,
+            description="Realtime Interact with environment and sense environment change",
+        )
         # 提示词配置
         USE_DARKSHINE_GUIDE: bool = Field(default=False, title="Use DarkSHINE Guide")
         USE_BESIII_GUIDE: bool = Field(default=False, title="Use BESIII Guide")
@@ -226,8 +250,12 @@ class Pipe:
         USE_CODE_INTERFACE: bool = Field(default=False)
         USE_MAPPING: bool = Field(default=False)
         USE_WEB_SEARCH: bool = Field(default=False)
-        GOOGLE_PSE_API_KEY: str = Field(default="api key here", title="Google PSE API Key")
-        GOOGLE_PSE_ENGINE_ID: str = Field(default="id here", title="Google PSE Engine ID")
+        GOOGLE_PSE_API_KEY: str = Field(
+            default="api key here", title="Google PSE API Key"
+        )
+        GOOGLE_PSE_ENGINE_ID: str = Field(
+            default="id here", title="Google PSE Engine ID"
+        )
         # 其他配置
         MAX_LOOP: int = Field(
             default=20, description="Prevent dead loop, 0 for unlimited."
@@ -263,9 +291,9 @@ class Pipe:
             "Content-Type": "application/json",
         }
         try:
-            #==================================================================
+            # ==================================================================
             # 初始化变量
-            #==================================================================
+            # ==================================================================
             # 获取chat id, user id, message id
             user_id, chat_id, message_id = self.extract_event_info(__event_emitter__)
 
@@ -302,9 +330,9 @@ class Pipe:
             payload = {**body, "model": self.valves.BASE_MODEL}
             messages = payload["messages"]
 
-            #==================================================================
+            # ==================================================================
             # 预处理消息（规范化、解析图片）
-            #==================================================================
+            # ==================================================================
             # TODO
             # self.process_message_figures(messages)
             # User proxy转移到User 角色以保护身份认同
@@ -315,20 +343,22 @@ class Pipe:
             self.set_system_prompt(messages, session_buffer, code_worker_op_system)
             # RAG用户消息
             if messages[-1]["role"] == "user":
-                results = await self.query_collection(messages[-1]["content"], collection_ids)
+                results = await self.query_collection(
+                    messages[-1]["content"], collection_ids
+                )
                 for result in results:
                     session_buffer.memory.add_object(result)
 
             log.debug("Old message:")
             log.debug(messages[1:])
 
-            #==================================================================
+            # ==================================================================
             # 发起API请求
-            #==================================================================
+            # ==================================================================
             create_new_round = True
             round_count = 0
             while create_new_round and round_count < self.valves.MAX_LOOP:
-                
+
                 # RAG队列大于阈值时等待，再继续下一轮
                 if session_buffer.rag_thread_mgr.active_count() > self.rag_thread_max:
                     await asyncio.sleep(0.1)
@@ -357,9 +387,9 @@ class Pipe:
                     async for line in response.aiter_lines():
                         if not line.startswith(self.data_prefix):
                             continue
-                        #======================================================
+                        # ======================================================
                         # 提前结束条件判断
-                        #======================================================
+                        # ======================================================
                         # 检查rag结果队列
                         while not session_buffer.rag_result_queue.empty():
                             result = session_buffer.rag_result_queue.get()
@@ -371,10 +401,10 @@ class Pipe:
                         # 判断是否打断当前生成并进入下一轮
                         if self.check_break_and_new_round(session_buffer, event_flags):
                             break
- 
-                        #======================================================
+
+                        # ======================================================
                         # 解析数据
-                        #======================================================
+                        # ======================================================
                         json_str = line[len(self.data_prefix) :]
 
                         # 去除首尾空格后检查是否为结束标记
@@ -390,18 +420,28 @@ class Pipe:
 
                         choice = data.get("choices", [{}])[0]
 
-
-                        #======================================================
+                        # ======================================================
                         # 结束条件判断
-                        #======================================================
+                        # ======================================================
                         if choice.get("finish_reason") or event_flags.early_end_round:
                             log.info("Finishing chat")
-                            self.update_assistant_message(messages, round_buffer, event_flags, prefix_reasoning=False)
-                            paragraph = await self.finalize_sentences(session_buffer, round_buffer)
+                            self.update_assistant_message(
+                                messages,
+                                round_buffer,
+                                event_flags,
+                                prefix_reasoning=False,
+                            )
+                            paragraph = await self.finalize_sentences(
+                                session_buffer, round_buffer
+                            )
                             if paragraph:
                                 session_buffer.rag_thread_mgr.submit(
                                     self.query_collection_to_queue,
-                                    args=(session_buffer.rag_result_queue, [paragraph], collection_ids)
+                                    args=(
+                                        session_buffer.rag_result_queue,
+                                        [paragraph],
+                                        collection_ids,
+                                    ),
                                 )
                             round_buffer.reset()
 
@@ -409,41 +449,60 @@ class Pipe:
                             create_new_round = False
                             round_count += 1
                             break
-                        #======================================================
+                        # ======================================================
                         # 思考状态处理
-                        #======================================================
-                        state_output = await self.update_thinking_state(choice.get("delta", {}), event_flags)
+                        # ======================================================
+                        state_output = await self.update_thinking_state(
+                            choice.get("delta", {}), event_flags
+                        )
                         if state_output:
                             yield state_output  # 直接发送状态标记
 
                         do_semantic_segmentation = False
                         if self.valves.REALTIME_RAG:
                             do_semantic_segmentation = True
-                        if self.valves.REALTIME_IO and self.is_answering(event_flags.thinking_state):
+                        if self.valves.REALTIME_IO and self.is_answering(
+                            event_flags.thinking_state
+                        ):
                             do_semantic_segmentation = True
-                        #======================================================
+                        # ======================================================
                         # 内容处理
-                        #======================================================
-                        content = self.process_content(choice["delta"], round_buffer, event_flags)
+                        # ======================================================
+                        content = self.process_content(
+                            choice["delta"], round_buffer, event_flags
+                        )
                         if content:
                             yield content
-                            self.update_assistant_message(messages, round_buffer, event_flags, prefix_reasoning=True)
+                            self.update_assistant_message(
+                                messages,
+                                round_buffer,
+                                event_flags,
+                                prefix_reasoning=True,
+                            )
 
                             if do_semantic_segmentation:
                                 # 根据语义分割段落
-                                sentence_n = await self.update_sentence_buffer(content, round_buffer)
+                                sentence_n = await self.update_sentence_buffer(
+                                    content, round_buffer
+                                )
                                 if sentence_n == 0:
                                     continue
-                                new_paragraphs = await self.semantic_segmentation(sentence_n, round_buffer)
+                                new_paragraphs = await self.semantic_segmentation(
+                                    sentence_n, round_buffer
+                                )
                                 if len(new_paragraphs) == 0:
                                     continue
                                 # 实时RAG搜索
                                 for paragraph in new_paragraphs:
                                     session_buffer.rag_thread_mgr.submit(
                                         self.query_collection_to_queue,
-                                        args=(session_buffer.rag_result_queue, [paragraph], collection_ids)
+                                        args=(
+                                            session_buffer.rag_result_queue,
+                                            [paragraph],
+                                            collection_ids,
+                                        ),
                                     )
-                     
+
                 log.debug(messages[1:])
         except Exception as e:
             yield self._format_error("Exception", str(e))
@@ -463,7 +522,9 @@ class Pipe:
             {"error": f"HTTP {status_code}: {err_msg}"}, ensure_ascii=False
         )
 
-    def check_break_and_new_round(self, session_buffer: SessionBuffer, event_flags: EventFlags):
+    def check_break_and_new_round(
+        self, session_buffer: SessionBuffer, event_flags: EventFlags
+    ):
         if_break = False
         # 工作记忆更新时打断
         if event_flags.mem_updated:
@@ -472,13 +533,16 @@ class Pipe:
             event_flags.mem_updated = False
         # RAG队列长度超过阈值时打断
         if session_buffer.rag_thread_mgr.active_count() > self.rag_thread_max:
-            log.info(f"Breaking chat round: RAG thread count {session_buffer.rag_thread_mgr.active_count()}")
+            log.info(
+                f"Breaking chat round: RAG thread count {session_buffer.rag_thread_mgr.active_count()}"
+            )
             if_break = True
 
         return if_break
-            
 
-    def extract_event_info(self, event_emitter: Callable[[dict], Awaitable[None]]) -> Tuple[str, str, str]:
+    def extract_event_info(
+        self, event_emitter: Callable[[dict], Awaitable[None]]
+    ) -> Tuple[str, str, str]:
         """
         从事件发射器中提取用户ID、聊天ID和消息ID。
         """
@@ -507,18 +571,23 @@ class Pipe:
                 user_id, "read"
             )  # 获取知识库
             # 获取知识库名称列表
-            rag_collection_names = [name.strip() for name in self.valves.RAG_COLLECTION_NAMES.split(',')]
+            rag_collection_names = [
+                name.strip() for name in self.valves.RAG_COLLECTION_NAMES.split(",")
+            ]
             # 遍历知识库列表
             for knowledge in knowledge_bases:
                 knowledge_name = knowledge.name  # 获取知识库名称
                 if knowledge_name in rag_collection_names:
-                    log.info(f"Adding knowledge base: {knowledge_name} ({knowledge.id})")
-                    collection_ids[knowledge_name] = (
-                        knowledge.id # 将知识库信息存储到字典中
+                    log.info(
+                        f"Adding knowledge base: {knowledge_name} ({knowledge.id})"
                     )
+                    collection_ids[knowledge_name] = (
+                        knowledge.id  # 将知识库信息存储到字典中
+                    )
+                    log.info(knowledge.data)  # output: {'file_ids': [...]}
                 if knowledge_name == long_chat_collection_name:
                     long_chat_knowledge = knowledge
-                  
+
             if not long_chat_knowledge:
                 log.info(
                     f"Creating long term memory knowledge base: {long_chat_collection_name}"
@@ -528,15 +597,13 @@ class Pipe:
                     description=f"Chat history for {self.model_id}",
                     access_control={},
                 )
-                long_chat_knowledge = Knowledges.insert_new_knowledge(user_id, form_data)
+                long_chat_knowledge = Knowledges.insert_new_knowledge(
+                    user_id, form_data
+                )
 
             log.info(
                 f"Loaded {len(collection_ids)} knowledge bases: {list(collection_ids.keys())}"
             )
- 
-            # Test here:
-            # - add a file with name and id: `long_chat_file_name` to open-webui files, with a content of "Hello, World!"
-            # - add this file to the knowledge base `long_chat_knowledge`
 
         except Exception as e:
             raise Exception(f"Failed to initialize knowledge bases: {str(e)}")
@@ -636,7 +703,7 @@ class Pipe:
         content 1 -> 0 \n</think>\n\n
         ---
         rc 0 -> 1
-        content ... 2 
+        content ... 2
         content '</think>' 2 -> 3
         content '\n\n' 3-> 4
         content ... 4 -> 0
@@ -644,7 +711,7 @@ class Pipe:
         """
         state_output = ""
 
-        #log.debug(f"Thinking state old: {event_flags.thinking_state}, delta: {delta}")
+        # log.debug(f"Thinking state old: {event_flags.thinking_state}, delta: {delta}")
 
         # 状态转换：未开始 -> 思考中
         if event_flags.thinking_state == 0 and delta.get("reasoning_content"):
@@ -666,11 +733,13 @@ class Pipe:
             # 4 -> 0
             event_flags.thinking_state = 0
 
-        #log.debug(f"Thinking state new: {event_flags.thinking_state}")
+        # log.debug(f"Thinking state new: {event_flags.thinking_state}")
 
         return state_output
 
-    def process_content(self, delta: dict, round_buffer: RoundBuffer, event_flags: EventFlags) -> str:
+    def process_content(
+        self, delta: dict, round_buffer: RoundBuffer, event_flags: EventFlags
+    ) -> str:
         """直接返回处理后的内容"""
         if delta.get("reasoning_content", ""):
             reasoning_content = delta.get("reasoning_content", "")
@@ -713,20 +782,26 @@ class Pipe:
             return sentence_len_new - sentence_len_old
         return 0
 
-    def update_assistant_message(self, messages, round_buffer, event_flags: EventFlags, prefix_reasoning: bool=False):
+    def update_assistant_message(
+        self,
+        messages,
+        round_buffer,
+        event_flags: EventFlags,
+        prefix_reasoning: bool = False,
+    ):
         """更新助手消息"""
         if prefix_reasoning:
             if round_buffer.total_response:
                 assistante_message = {
                     "role": "assistant",
                     "content": f"<think>\n\n{round_buffer.reasoning_content}\n</think>\n\n{round_buffer.total_response}",
-                    "prefix": True
+                    "prefix": True,
                 }
             else:
                 assistante_message = {
                     "role": "assistant",
                     "content": f"<think>\n\n{round_buffer.reasoning_content}",
-                    "prefix": True
+                    "prefix": True,
                 }
                 event_flags.thinking_state = 2
         else:
@@ -737,7 +812,7 @@ class Pipe:
             assistante_message = {
                 "role": "assistant",
                 "content": round_buffer.total_response,
-                "prefix": True
+                "prefix": True,
             }
 
         if messages[-1]["role"] == "assistant":
@@ -794,13 +869,15 @@ class Pipe:
         :return: 新段落列表
         """
         new_paragraphs = []
-        
+
         # 滑动窗口获取嵌入向量
         window_size = 3
         window_step = 1
         sim_threshold = 0.8
 
-        for i in range(len(round_buffer.sentences) - sentence_n, len(round_buffer.sentences)):
+        for i in range(
+            len(round_buffer.sentences) - sentence_n, len(round_buffer.sentences)
+        ):
             begin_idx = i - window_size + 1
             if begin_idx < 0:
                 continue
@@ -819,11 +896,14 @@ class Pipe:
             round_buffer.window_embeddings.append(embeddings[0])
             if len(round_buffer.window_embeddings) > 1:
                 similarity = self.cosine_similarity(
-                    round_buffer.window_embeddings[-2], round_buffer.window_embeddings[-1]
+                    round_buffer.window_embeddings[-2],
+                    round_buffer.window_embeddings[-1],
                 )
                 if similarity < sim_threshold:
                     paragraph = "".join(
-                        round_buffer.sentences[round_buffer.paragraph_begin_id : begin_idx]
+                        round_buffer.sentences[
+                            round_buffer.paragraph_begin_id : begin_idx
+                        ]
                     )
                     new_paragraphs.append(paragraph)
                     round_buffer.paragraph_begin_id = begin_idx
@@ -833,7 +913,9 @@ class Pipe:
 
         return new_paragraphs
 
-    async def finalize_sentences(self, session_buffer: SessionBuffer, round_buffer: RoundBuffer) -> str:
+    async def finalize_sentences(
+        self, session_buffer: SessionBuffer, round_buffer: RoundBuffer
+    ) -> str:
         """
         将缓冲区中的文本添加到句子列表中。
         :param session_buffer: 会话缓冲区
@@ -846,7 +928,7 @@ class Pipe:
             sentence_len_old = len(round_buffer.sentences)
             mark_pattern = r"^[\s\W_]+$"
             if (
-                re.match(mark_pattern, round_buffer.sentence_buffer.strip())   # 纯符号
+                re.match(mark_pattern, round_buffer.sentence_buffer.strip())  # 纯符号
                 and len(round_buffer.sentences) > 0
             ):
                 round_buffer.sentences[-1] += round_buffer.sentence_buffer
@@ -854,22 +936,26 @@ class Pipe:
                 round_buffer.sentences.append(round_buffer.sentence_buffer)
             round_buffer.sentence_buffer = ""
             sentence_len_new = len(round_buffer.sentences)
-            sentence_n =  sentence_len_new - sentence_len_old
+            sentence_n = sentence_len_new - sentence_len_old
         if len(round_buffer.sentences) - round_buffer.paragraph_begin_id > 0:
             paragraph = "".join(
-                round_buffer.sentences[round_buffer.paragraph_begin_id:]
+                round_buffer.sentences[round_buffer.paragraph_begin_id :]
             )
             return paragraph
         return ""
-    
-    async def search_chroma_db(self, collection_id, embeddings: List, top_k: int, max_distance: float):
+
+    async def search_chroma_db(
+        self, collection_id, embeddings: List, top_k: int, max_distance: float
+    ):
         """
         Search Chroma DB
         """
         result_objects = []
         try:
             if not collection_id in VECTOR_DB_CLIENT.client.list_collections():
-                log.warning(f"Collection {collection_id} not found in Vector DB, maybe this is an empty collection.")
+                log.warning(
+                    f"Collection {collection_id} not found in Vector DB, maybe this is an empty collection."
+                )
                 return result_objects
 
             results = VECTOR_DB_CLIENT.search(
@@ -883,7 +969,9 @@ class Pipe:
 
             for query_i in range(len(embeddings)):
                 for k in range(len(results.ids[query_i])):
-                    if (max_distance > 0) and (results.distances[query_i][k] > max_distance):
+                    if (max_distance > 0) and (
+                        results.distances[query_i][k] > max_distance
+                    ):
                         continue
                     result_objects.append(
                         VectorDBResultObject(
@@ -901,7 +989,13 @@ class Pipe:
         return result_objects
 
     async def query_collection(
-            self, query_keywords: List[str], collection_ids: Dict[str, str], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0 ) -> list:
+        self,
+        query_keywords: List[str],
+        collection_ids: Dict[str, str],
+        knowledge_names: List[str] = [],
+        top_k: int = 1,
+        max_distance: float = 0,
+    ) -> list:
         log.debug("Querying Knowledge Collection")
         embeddings = []
         if self.valves.GENERATE_KEYWORDS_FROM_MODEL:
@@ -926,7 +1020,9 @@ class Pipe:
             for knowledge_name in knowledge_names:
                 collection_id = collection_ids[knowledge_name]
                 log.debug(f"Searching collection: {knowledge_name}")
-                results = await self.search_chroma_db(collection_id, query_embeddings, top_k, max_distance)
+                results = await self.search_chroma_db(
+                    collection_id, query_embeddings, top_k, max_distance
+                )
                 if not results:
                     continue
                 all_results.extend(results)
@@ -940,9 +1036,21 @@ class Pipe:
 
         return []
 
-    def query_collection_to_queue(self, result_queue: Queue, query_keywords: List[str], collection_ids: Dict[str, str], knowledge_names: List[str] = [], top_k: int = 1, max_distance: float = 0.0):
+    def query_collection_to_queue(
+        self,
+        result_queue: Queue,
+        query_keywords: List[str],
+        collection_ids: Dict[str, str],
+        knowledge_names: List[str] = [],
+        top_k: int = 1,
+        max_distance: float = 0.0,
+    ):
         try:
-            results = asyncio.run(self.query_collection(query_keywords, collection_ids, knowledge_names, top_k, max_distance))
+            results = asyncio.run(
+                self.query_collection(
+                    query_keywords, collection_ids, knowledge_names, top_k, max_distance
+                )
+            )
             if results:
                 log.debug(f"Put into results")
                 result_queue.put(results)
@@ -951,26 +1059,26 @@ class Pipe:
 
     def extract_json(self, content):
         # 匹配 ```json 块中的 JSON
-        json_block_pattern = r'```json\s*({.*?})\s*```'
+        json_block_pattern = r"```json\s*({.*?})\s*```"
         # 匹配 ``` 块中的 JSON
-        block_pattern = r'```\s*({.*?})\s*```'
+        block_pattern = r"```\s*({.*?})\s*```"
         log.debug(f"Content: {content}")
         try:
             # 尝试匹配 ```json 块
             match = re.search(json_block_pattern, content, re.DOTALL)
             if match:
                 return json.loads(match.group(1))
-    
+
             # 尝试匹配 ``` 块
             match = re.search(block_pattern, content, re.DOTALL)
             if match:
                 return json.loads(match.group(1))
-    
+
             # 尝试直接转换
             return json.loads(content)
         except Exception as e:
             log.error(f"Failed to extract JSON: {e}")
-    
+
         return None
 
     async def generate_query_keywords(self, contexts: List):
@@ -983,18 +1091,18 @@ class Pipe:
         template = Template(query_template)
         current_date = datetime.now()
         formatted_date = current_date.strftime("%Y-%m-%d")
-        #if len(messages) > 7:
+        # if len(messages) > 7:
         #    short_messages = [messages[0]] + messages[-6:]
-        #else:
+        # else:
         #    short_messages = messages
-        
+
         # Render the template with a list of items
         replace = {"CURRENT_DATE": formatted_date, "CONTEXTS": contexts}
         query_prompt = template.render(**replace)
         task_messages = [{"role": "user", "content": query_prompt}]
         headers = {"Authorization": f"Bearer {self.valves.MODEL_API_KEY}"}
         payload = {
-            "model":  self.valves.TASK_MODEL,
+            "model": self.valves.TASK_MODEL,
             "messages": task_messages,
         }
         keywords = []
@@ -1015,7 +1123,9 @@ class Pipe:
         log.debug(f"Generated query keywords: {keywords}")
         return keywords
 
-    def set_system_prompt(self, messages, session_buffer: SessionBuffer, op_system: str):
+    def set_system_prompt(
+        self, messages, session_buffer: SessionBuffer, op_system: str
+    ):
         # Working memory
         wm_template = "## Context\n\n{{WORKING_MEMORY}}---\n"
 
@@ -1025,7 +1135,11 @@ class Pipe:
         formatted_date = current_date.strftime("%Y-%m-%d")
 
         # Render the template with a list of items
-        context = {"CURRENT_DATE": formatted_date, "OP_SYSTEM": op_system, "WORKING_MEMORY": str(session_buffer.memory)}
+        context = {
+            "CURRENT_DATE": formatted_date,
+            "OP_SYSTEM": op_system,
+            "WORKING_MEMORY": str(session_buffer.memory),
+        }
         result = template.render(**context)
 
         # Set system_prompt
@@ -1065,3 +1179,4 @@ Strictly return in JSON format:
 {{ item }}
 {% endfor %}
 """
+
