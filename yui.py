@@ -47,7 +47,9 @@ log.setLevel("DEBUG")
 
 
 class ManagedThread(threading.Thread):
-    """自定义线程类，用于在线程结束时自动从管理器移除"""
+    """
+    Managed thread class for automatic removal from manager when thread ends
+    """
 
     def __init__(self, manager, target, args, kwargs):
         super().__init__(target=target, args=args, kwargs=kwargs)
@@ -63,7 +65,9 @@ class ManagedThread(threading.Thread):
 
 
 class ThreadManager:
-    """线程管理器类"""
+    """
+    Thread manager class
+    """
 
     def __init__(self):
         self.threads = []  # 存储活跃线程的容器
@@ -106,6 +110,9 @@ class ThreadManager:
 
 @dataclass
 class VectorDBResultObject:
+    """
+    Vector DB search result object
+    """
     id_: str
     distance: float
     document: str
@@ -114,6 +121,9 @@ class VectorDBResultObject:
 
 
 class WorkingMemory:
+    """
+    Working memory class
+    """
     def __init__(self, chat_id, max_size=10):
         self.filename = f"working_memory_{chat_id}.json"
         self.max_size = max_size
@@ -152,9 +162,6 @@ class WorkingMemory:
     def __str__(self):
         output = ""
         for obj in self.objects:
-            log.debug(
-                f"Result Document: {obj.document}\nDistance: {obj.distance}\nMetadata: {obj.metadata}"
-            )
             source = obj.metadata.get("source", "Unknown").replace("~", "/")
             output += f'<context source="{source}">\n{obj.document}\n</context>\n\n'
         return output
@@ -164,6 +171,9 @@ class WorkingMemory:
 
 
 class EventFlags:
+    """
+    Event flags class
+    """
     def __init__(self):
         self.thinking_state: int = 0
         self.early_end_round = False
@@ -171,15 +181,23 @@ class EventFlags:
 
 
 class SessionBuffer:
+    """
+    Variables for a chat session
+    """
     def __init__(self, chat_id):
         self.rag_thread_mgr: ThreadManager = ThreadManager()
         self.rag_result_queue: Queue = Queue()
         self.memory: WorkingMemory = WorkingMemory(chat_id)
         self.chat_history: str = ""
+        self.code_worker = None
+        self.code_worker_op_system = "Linux"
         # TODO: Sensor
 
 
 class RoundBuffer:
+    """
+    Variables for a chat round
+    """
     def __init__(self):
         self.sentence_buffer: str = ""
         self.sentences: List[str] = []
@@ -199,7 +217,9 @@ class RoundBuffer:
 
 class Pipe:
     class Valves(BaseModel):
-        # 模型配置
+        """
+        Configuration for the pipe
+        """
         MODEL_API_BASE_URL: str = Field(
             default="https://aiapi001.ihep.ac.cn/apiv2",
             description="语言模型API的基础请求地址",
@@ -244,12 +264,20 @@ class Pipe:
             description="Realtime Interact with environment and sense environment change",
         )
         # 提示词配置
-        USE_DARKSHINE_GUIDE: bool = Field(default=False, title="Use DarkSHINE Guide")
+        USE_DARKSHINE_GUIDE: bool = Field(default=True, title="Use DarkSHINE Guide")
         USE_BESIII_GUIDE: bool = Field(default=False, title="Use BESIII Guide")
         # 工具配置
-        USE_CODE_INTERFACE: bool = Field(default=False)
+        USE_CODE_INTERFACE: bool = Field(default=True)
+        USE_WEB_SEARCH: bool = Field(default=True)
         USE_MAPPING: bool = Field(default=False)
-        USE_WEB_SEARCH: bool = Field(default=False)
+        CODE_WORKER_NAME: str = Field(
+            default="xuliang/code-worker-v2",
+            description="Code worker model name",
+        )
+        CODE_WORKER_BASE_URL: str = Field(
+            default="https://aiapi001.ihep.ac.cn/apiv2",
+            description="Code worker API base URL",
+        )
         GOOGLE_PSE_API_KEY: str = Field(
             default="api key here", title="Google PSE API Key"
         )
@@ -270,7 +298,6 @@ class Pipe:
         self.rag_thread_max = 1
 
     def pipes(self):
-
         return [
             {
                 "id": self.model_id,
@@ -313,17 +340,15 @@ class Pipe:
             # Initialize tools
             TOOL = {}
             prompt_templates = {}
-            code_worker = None
-            code_worker_op_system = "Linux"
 
             if self.valves.USE_CODE_INTERFACE:
-                TOOL["code_interface"] = self._code_interface
+                TOOL["code_interface"] = self.code_interface
                 prompt_templates["code_interface"] = (
                     self.DEFAULT_CODE_INTERFACE_PROMPT()
                 )
-                code_worker, code_worker_op_system = self.init_code_worker()
+                session_buffer.code_worker, session_buffer.code_worker_op_system = self.init_code_worker()
             if self.valves.USE_WEB_SEARCH:
-                TOOL["web_search"] = self._web_search
+                TOOL["web_search"] = self.web_search
                 prompt_templates["web_search"] = self.DEFAULT_WEB_SEARCH_PROMPT()
 
             # 获取请求参数
@@ -340,7 +365,7 @@ class Pipe:
             # 处理消息以防止相同的角色
             await self.merge_adjacent_roles(messages)
             # 更新系统提示词
-            self.set_system_prompt(messages, session_buffer, code_worker_op_system)
+            self.set_system_prompt(messages, prompt_templates, session_buffer)
             # RAG用户消息
             if messages[-1]["role"] == "user":
                 results = await self.query_collection(
@@ -365,7 +390,7 @@ class Pipe:
                     continue
 
                 # 更新系统提示词
-                self.set_system_prompt(messages, session_buffer, code_worker_op_system)
+                self.set_system_prompt(messages, prompt_templates, session_buffer)
 
                 log.debug(messages[1:])
                 log.info("Starting chat round")
@@ -1089,7 +1114,7 @@ class Pipe:
         """
         Generate query keywords using llm
         """
-        query_template = self.DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE()
+        query_template = self.DEFAULT_QUERY_GENERATION_PROMPT()
 
         # Create a Jinja2 Template object
         template = Template(query_template)
@@ -1128,20 +1153,42 @@ class Pipe:
         return keywords
 
     def set_system_prompt(
-        self, messages, session_buffer: SessionBuffer, op_system: str
+        self, messages, prompt_templates, session_buffer: SessionBuffer
     ):
-        # Working memory
-        wm_template = "## Context\n\n{{WORKING_MEMORY}}---\n"
+        """
+        ## Context
+        ## Available Tools
+        ## Physics Guides
+        ## Task Prompt
+        """
+        # Context
+        template_string = "## Context\n\n{{WORKING_MEMORY}}---\n"
+
+        # Available Tools
+        if len(prompt_templates) > 0:
+            template_string += "\n## Available Tools\n"
+            for i, (name, prompt) in enumerate(prompt_templates.items()):
+                template_string += f"\n### {i+1}. {prompt}\n"
+
+        # Physics Guides
+        if self.valves.USE_DARKSHINE_GUIDE:
+            template_string += self.DARKSHINE_PROMPT()
+
+        if self.valves.USE_BESIII_GUIDE:
+            template_string += self.BESIII_PROMPT()
+
+        # Task Prompt
+        template_string += self.GUIDE_PROMPT()
 
         # Create a Jinja2 Template object
-        template = Template(wm_template)
+        template = Template(template_string)
         current_date = datetime.now()
         formatted_date = current_date.strftime("%Y-%m-%d")
 
         # Render the template with a list of items
         context = {
             "CURRENT_DATE": formatted_date,
-            "OP_SYSTEM": op_system,
+            "OP_SYSTEM": session_buffer.code_worker_op_system,
             "WORKING_MEMORY": str(session_buffer.memory),
         }
         result = template.render(**context)
@@ -1153,13 +1200,694 @@ class Pipe:
             context_message = {"role": "system", "content": result}
             messages.insert(0, context_message)
 
-    def DEFAULT_CODE_INTERFACE_PROMPT(self):
+    # =========================================================================
+    # Code Interface
+    # =========================================================================
+    def init_code_worker(self):
+        try:
+            code_worker = HRModel.connect(
+                name=self.valves.CODE_WORKER_NAME,
+                base_url=self.valves.CODE_WORKER_BASE_URL,
+            )
+            funcs = code_worker.functions()  # Get all remote callable functions.
+            log.info(f"Remote callable funcs: {funcs}")
+            op_system = code_worker.inspect_system()
+
+            return code_worker, op_system
+
+        except Exception as e:
+            log.error(f"Error initializing code worker: {e}")
+
+        return None, "Linux"
+
+    async def code_interface(self, session_buffer, attributes: dict, content: str) -> Tuple[str, str]:
+        log.debug("Starting Code Interface")
+        if session_buffer.code_worker is None:
+            session_buffer.code_worker, session_buffer.code_worker_op_system = self.init_code_worker()
+
+        # Extract the code interface type and language
+        code_type = attributes.get("type", "")
+        lang = attributes.get("lang", "")
+        filename = attributes.get("filename", "")
+
+        # Remove the first line and the last line (markdown code block)
+        lines = content.strip().splitlines()
+        if len(lines) <= 2:
+            return (
+                "Error: Too few lines to extract code",
+                "Check if you have code in markdown code block",
+            )
+        lines = lines[1:-1]
+        content = "\n".join(lines)
+
+        if code_type == "exec":
+            # Execute the code
+            if filename:
+                try:
+                    result = session_buffer.code_worker.write_code(
+                        file_path=filename,
+                        content=content,
+                        execute=True,
+                        lang=lang,
+                        timeout=-1,
+                    )
+                    return f"Executed code: {filename}", result
+                except Exception as e:
+                    return f"Error executing {filename}", f"{str(e)}"
+            elif lang == "bash":
+                try:
+                    result = session_buffer.code_worker.run_command(command=content, timeout=300)
+                    return "Command executed", result
+                except Exception as e:
+                    return "Error executing bash command", f"{str(e)}"
+            else:
+                return (
+                    "No filename provided for code execution",
+                    "Please provide filename in xml attribute.",
+                )
+
+        elif code_type == "write":
+            if not filename:
+                return (
+                    "No filename provided for code writing",
+                    "Please provide filename in xml attribute.",
+                )
+            # Write the code to a file
+            try:
+                result = session_buffer.code_worker.write_code(
+                    file_path=filename, content=content
+                )
+                return f"Written file: {filename}", result
+            except Exception as e:
+                return f"Error writing {filename}", f"{str(e)}"
+
+        elif code_type == "search_replace":
+            if not filename:
+                return (
+                    "No filename provided for code search and replace",
+                    "Please provide filename in xml attribute.",
+                )
+            # extract the original and updated code
+            edit_block_pattern = re.compile(
+                r"<<<<<<< ORIGINAL\s*(?P<original>.*?)"
+                r"=======\s*(?P<mid>.*?)"
+                r"\s*(?P<updated>.*)>>>>>>> ",
+                re.DOTALL,
+            )
+            match = edit_block_pattern.search(content)
+            if match:
+                original = match.group("original")
+                updated = match.group("updated")
+                try:
+                    result = session_buffer.code_worker.search_replace(
+                        file_path=filename, original=original, updated=updated
+                    )
+                    return f"Updated {filename}", result
+                except Exception as e:
+                    return f"Error searching and replacing {filename}", f"{str(e)}"
+            else:
+                return (
+                    "Invalid search and replace format",
+                    "Format: <<<<<<< ORIGINAL\nOriginal code\n=======\nUpdated code\n>>>>>>> UPDATED",
+                )
+        else:
+            return (
+                f"Invalid code interface type `{code_type}`",
+                "Available types: `exec`, `write`",
+            )
+
+    # =========================================================================
+    # Web Search
+    # =========================================================================
+    async def web_search(self, session_buffer, attributes: dict, content: str) -> Tuple[str, str]:
+        log.debug("Starting Web Search")
+        # Extract the search query from the content
+        search_query = content.strip()
+
+        if not search_query:
+            return "No search query provided", ""
+
+        engine = attributes.get("engine", "")
+
+        # Handle Google Custom Search
+        if (
+            engine == "google"
+            and self.valves.GOOGLE_PSE_API_KEY
+            and self.valves.GOOGLE_PSE_ENGINE_ID
+        ):
+            # Construct the Google search URL
+            google_search_url = f"https://www.googleapis.com/customsearch/v1?q={search_query}&key={self.valves.GOOGLE_PSE_API_KEY}&cx={self.valves.GOOGLE_PSE_ENGINE_ID}&num=5"
+
+            try:
+                with httpx.AsyncClient(http2=True) as client:
+                    response = await client.get(google_search_url)
+                    if response.status_code == 200:
+                        data = response.json()
+                        items = data.get("items", [])
+                        search_results = []
+                        urls = []
+                        for item in items:
+                            title = item.get("title", "No title")
+                            link = item.get("link", "No link")
+                            urls.append(link)
+                            snippet = item.get("snippet", "No snippet")
+                            search_results.append(f"**{title}**\n{snippet}\n{link}\n")
+
+                        if search_results:
+                            result = "\n\n".join(search_results)
+                            return f"Searched {len(urls)} sites", result
+                        else:
+                            return "No results found on Google", search_query
+                    else:
+                        return (
+                            f"Google search failed with status code {response.status_code}",
+                            search_query,
+                        )
+            except Exception as e:
+                return "Error during Google search", f"{str(e)}\nQuery: {search_query}"
+
+        # Handle ArXiv search
+        if engine == "arxiv":
+            arxiv_search_url = f"http://export.arxiv.org/api/query?search_query=all:{search_query}&start=0&max_results=5"
+
+            try:
+                with httpx.AsyncClient(http2=True) as client:
+                    response = await client.get(arxiv_search_url)
+                    if response.status_code == 200:
+                        data = response.text
+                        # Extract entries using regex
+                        pattern = re.compile(r"<entry>(.*?)</entry>", re.DOTALL)
+                        matches = pattern.findall(data)
+
+                        arxiv_results = []
+                        urls = []
+                        for match in matches:
+                            title_match = re.search(r"<title>(.*?)</title>", match)
+                            link_match = re.search(r"<id>(.*?)</id>", match)
+                            summary_match = re.search(
+                                r"<summary>(.*?)</summary>", match, re.DOTALL
+                            )
+
+                            if title_match and link_match and summary_match:
+                                title = title_match.group(1)
+                                link = link_match.group(1)
+                                urls.append(link)
+                                summary = summary_match.group(1).strip()
+                                arxiv_results.append(f"**{title}**\n{summary}\n{link}\n")
+                            else:
+                                log.error("Error parsing ArXiv entry.")
+
+                        if arxiv_results:
+                            result = "\n\n".join(arxiv_results)
+                            return f"Searched {len(urls)} papers", result
+                        else:
+                            return "No results found on ArXiv", search_query
+                    else:
+                        return (
+                            f"ArXiv search failed with status code {response.status_code}",
+                            search_query,
+                        )
+            except Exception as e:
+                return "Error during ArXiv search", f"{str(e)}\nQuery: {search_query}"
+
+        return (
+            "Invalid search source or query",
+            f"Search engine: {engine}\nQuery:{search_query}",
+        )
+
+    # =========================================================================
+    # Vision Language Model
+    # =========================================================================
+
+    async def generate_vl_response(
+        self,
+        prompt: str,
+        image_url: str,
+        model: str = "Qwen/Qwen2-VL-72B-Instruct",
+        url: str = "https://api.siliconflow.cn/v1",
+        key: str = "",
+    ) -> str:
+        try:
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_url, "detail": "high"},
+                            },
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            },
+                        ],
+                    }
+                ],
+                "stream": False,
+                "max_tokens": 512,
+                "stop": None,
+                "temperature": 0.1,
+                "top_p": 0.5,
+                "top_k": 30,
+                "frequency_penalty": 1.1,
+                "n": 1,
+                "response_format": {"type": "text"},
+            }
+
+            response = requests.request(
+               "POST",
+               url=f"{url}/chat/completions",
+               json=payload,
+               headers={
+                   "Authorization": f"Bearer {key}",
+                   "Content-Type": "application/json"
+               },
+               #proxies = {
+               #   'http': 'http://127.0.0.1:7890',
+               #   'https': 'http://127.0.0.1:7890',
+               #}
+            )
+
+            # Check for valid response
+            response.raise_for_status()
+
+            # Parse and return embeddings if available
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+
+        except httpx.HTTPStatusError as e:
+            log.error(
+                f"HTTP error occurred: {e.response.status_code} - {e.response.text}"
+            )
+            return f"HTTP error occurred: {e.response.status_code} - {e.response.text}"
+        except httpx.ReadTimeout as e:
+            log.error(f"Read Timeout error occurred")
+            return f"Read Timeout error occurred"
+
         return ""
+
+    def extract_image_urls(self, text: str) -> list:
+        """
+        Extract image URLs from text with 2 criteria:
+        1. URLs ending with .png/.jpeg/.jpg/.gif/.svg (case insensitive)
+        2. URLs in markdown image format regardless of extension
+
+        Args:
+            text: Input text containing potential image URLs
+
+        Returns:
+            List of unique image URLs sorted by first occurrence
+        """
+        # Match URLs with image extensions (including query parameters)
+        ext_pattern = re.compile(
+            r"https?:\/\/[^\s]+?\.(?:png|jpe?g|gif|svg)(?:\?[^\s]*)?(?=\s|$)",
+            re.IGNORECASE,
+        )
+
+        # Match markdown image syntax URLs
+        md_pattern = re.compile(r"!\[[^\]]*\]\((https?:\/\/[^\s\)]+)")
+
+        # Find all matches while preserving order
+        seen = set()
+        result = []
+
+        for match in ext_pattern.findall(text) + md_pattern.findall(text):
+            if match not in seen:
+                seen.add(match)
+                result.append(match)
+
+        return result
+
+    async def query_vision_model(
+        self,
+        prompt: str,
+        image_urls: List[str],
+    ) -> str:
+        # Batch logging directory-style URLs first
+        for idx, url in enumerate(image_urls, 1):
+            if not url.startswith("data:image"):
+                log.debug(f"Processing image {idx}: {url}")
+    
+        # Configure execution parameters
+        BATCH_SIZE = 5  # Controlled concurrency for large image batches
+        results = []
+        
+        # Process in parallel batches
+        for i in range(0, len(image_urls), BATCH_SIZE):
+            batch_urls = image_urls[i:i+BATCH_SIZE]
+            tasks = [
+                self.generate_vl_response(
+                    prompt=prompt,
+                    image_url=url,
+                    model="ark/doubao-vision-pro",
+                    url=self.valves.MODEL_API_BASE_URL,
+                    key=self.valves.MODEL_API_KEY,
+                )
+                for url in batch_urls
+            ]
+            batch_results = await asyncio.gather(*tasks)
+            results.extend(batch_results)
+    
+        # Format ordered response
+        return "\n\n".join(
+            f"**Figure {idx}:** {res}" 
+            for idx, res in enumerate(results, 1)
+        )
+
+    # =========================================================================
+    # System prompt templates for Main Model
+    # =========================================================================
+
+    def DEFAULT_CODE_INTERFACE_PROMPT(self):
+        return """Code Interface
+
+You have access to a user's {{OP_SYSTEM}} computer workspace. You use `<code_interface>` XML tag to write codes to do analysis, calculations, or problem-solving.
+
+#### Examples
+
+User: plot something
+Assistant: <code_interface type="exec" lang="python" filename="plot.py">
+
+```python
+# plot and save png figure to a relative path
+```
+
+</code_interface>
+
+---
+
+User: Create and test a simple cmake project named HelloWorld
+Assistant: <code_interface type="write" lang="cmake" filename="HelloWorld/CMakeList.txt">
+
+```cmake
+...
+```
+
+</code_interface>
+
+<code_interface type="write" lang="cpp" filename="HelloWorld/src/main.cpp">
+
+```cpp
+...
+```
+
+</code_interface>
+
+<code_interface type="exec" lang="bash" filename="HelloWorld/build_and_test.sh">
+
+```bash
+#!/bin/bash
+# assume run in parent directory of filename
+mkdir -p build
+cd build
+cmake ..
+make
+./MyExecutable
+```
+
+</code_interface>
+
+#### Tool Attributes
+
+- `type`: Specifies the action to perform.
+   - `exec`: Write code and execute the code immediately.
+      - Supported languages: `python`, `bash`, `root` (root macro), `boss`
+   - `write`: Simply write to file.
+      - Supports any programming language.
+
+- `filename`: The file path where the code will be written.  
+   - Must be **relative to the user's workspace base directory**, do not use paths relative to subdirectory.
+
+#### Usage Instructions
+
+- The Python code you write can incorporate a wide array of libraries, handle data manipulation or visualization, perform API calls for web-related tasks, or tackle virtually any computational challenge. Use this flexibility to **think outside the box, craft elegant solutions, and harness Python's full potential**.
+- An **extra line break** is always needed **between the `<code_interface>` XML tag and markdown code block**.
+- Use the `<code_interface>` XML node and stop right away to wait for user's action.
+- Only one code block is allowd in one `<code_interface>` XML node. DO NOT use two or more markdown code blocks together.
+- Coding style instruction:
+  - **Always aim to give meaningful outputs** (e.g., results, tables, summaries, or visuals) to better interpret and verify the findings. Avoid relying on implicit outputs; prioritize explicit and clear print statements so the results are effectively communicated to the user.
+   - Run in batch mode. Save figures to png.
+   - Prefer object-oriented programming
+   - Prefer arguments with default value than hard coded
+   - For potentially time-consuming code, e.g., loading file with unknown size, use argument to control the running scale, and defaulty run on small scale test.
+"""
 
     def DEFAULT_WEB_SEARCH_PROMPT(self):
+        return """Web Search
+
+- You have access to internet, use `<web_search>` XML tag to search the web for new information and references. Example:
+
+**Calling Web Search Tool:**
+
+<web_search engine="google">first query here</web_search>
+<web_search engine="google">second query here</web_search>
+
+#### Tool Attributes
+
+- `engine`: available options:
+  - `google`: Search on google.
+  - `arxiv`: Always use english keywords for arxiv.
+
+####  Usage Instructions
+
+- Enclose only one query in one pair of `<web_search engine="...">` `</web_search>` XML tags. You can use multiple lines of `<web_search>` XML tags for each query, to do parallel search.
+- Err on the side of suggesting search queries if there is **any chance** they might provide useful or updated information.
+- Always prioritize providing actionable and broad query that maximize informational coverage.
+- In each web_search XML tag, be concise and focused on composing high-quality search query, **avoiding unnecessary elaboration, commentary, or assumptions**.
+- No need to bother API keys because user can handle by themselves in this tool.
+- **The date today is: {{CURRENT_DATE}}**. So you can search for web to get information up do date {{CURRENT_DATE}}.
+"""
+
+
+    def DARKSHINE_PROMPT(self):
+        return """
+## DarkSHINE Physics Analysis Guide:
+
+### Introduction
+
+DarkSHINE Experiment is a fixed-target experiment to search for dark photons (A') produced in 8 GeV electron-on-target (EOT) collisions. The experiment is designed to detect the invisible decay of dark photons, which escape the detector with missing energy and missing momentum. The DarkSHINE detector consists of Tagging Tracker, Target, Recoil Tracker, Electromagnetic Calorimeter (ECAL), Hadronic Calorimeter (HCAL).
+
+The Target is a thin plate (~350 um) of Tungsten.
+
+Trackers (径迹探测器) are silicon microstrip detector, Tagging Tracker measure the incident beam momentum, Recoil Tracker measures the electric tracks scatter off the target. Missing momentum can be calculated by TagTrk2_pp[0] - RecTrk2_pp[0]
+
+ECAL (电磁量能器) is cubics of LYSO crystal scintillator cells, with high energy precision.
+
+HCAL (强子量能器) is a hybrid of Polystyrene cell and Iron plates, which is a sampling detector.
+
+Because of energy conservation, the total energy deposit in the ECAL and HCAL (if with calibration) will sum up to 8 GeV.
+
+Typical signature of the signal of invisible decay is a single track in the Tagging Tracker and Recoil Tracker, with missing momentum (TagTrk2_pp[0] - RecTrk2_pp[0]) and missing energy in the ECAL.
+
+Bremstruhlung events results in missing momentum, but small missing energy in the ECAL.
+
+Usually SM electron-nuclear or photon-nuclear process will create multiple tracks in the recoil tracker, thus not mis identified as signal, but still are a ratio of events passing the track number selection, and with MIP particles in the final states, becoming background. They can be veto by the HCAL with a HCAL Max Cell Energy cut (signal region defined by HCAL Max Cell energy lower than some value e.g. 1 MeV).
+
+Process with neutrino will be irreducible background, however with ignorable branching ratio.
+
+### Simulation and Reconstruction
+
+#### Examples
+
+User: For DarkSHINE, simulate and reconstruct inclusive background events
+Assistant: <code_interface type="exec" lang="bash" filename="background_inclusive_eot.sh">
+
+```bash
+#!/bin/bash
+
+# Set the original config file directory
+dsimu_script_dir="/opt/darkshine-simulation/source/DP_simu/scripts"
+default_yaml="$dsimu_script_dir/default.yaml"
+magnet_file="$dsimu_script_dir/magnet_0.75_20240521.root"
+
+echo "-- Preparing simulation config"
+sed "s:  mag_field_input\::  mag_field_input\: \"${magnet_file}\"  \#:" $default_yaml > default.yaml
+
+echo "-- Running simulation and output to dp_simu.root"
+DSimu -y default.yaml -b 100 -f dp_simu.root > simu.out 2> simu.err
+
+echo "-- Preparing reconstruction config (default input dp_simu.root and output dp_ana.root)"
+DAna -x > config.txt
+
+echo "-- Running reconstruction and output to dp_ana.root"
+DAna -c config.txt
+
+echo "All done!"
+```
+
+</code_interface>
+
+#### Simulation and Reconstruction Steps
+
+1. Configure the beam parameters and detector geometries for the simulation setup
+2. Signal simulation and reconstruction
+   1. Decide the free parameters to scan according to the signal model
+   2. Simulate signal events
+      1. Prepare config file
+      2. Run simulation program
+         - DSimu: DarkSHINE MC event generator
+         - boss.exe: BESIII MC event generator
+   3. Reconstruct the signal events.
+      1. Prepare config file
+      2. Run reconstruction program
+         - DAna: DarkSHINE reconstruction program
+         - boss.exe: BESIII reconstruction program
+3. Background simulation and reconstruction
+   1. Configure the physics process for background events
+   2. Simulate background events
+   3. Reconstruct background events
+
+### Validation
+
+#### Examples
+
+User: Compare varaibles of signal and background events
+Assistant: <code_interface type="exec" lang="python" filename="compare_kinematics.py">
+
+```python
+import ROOT
+import numpy
+import matplotlib.pyplot as plt
+import argparse
+from pathlib import Path
+...
+
+def compare(column: str, fig_name: str):
+    # create output dir if not exists
+    # load files
+    # draw histogram with pre_selection and column
+    # overlay histograms of signal and background
+    # save to png
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Compare kinematics of signal and background events.')
+    parser.add_argument('--pre-selection', default='', help='Pre-selection to apply')
+    parser.add_argument('--log-scale', action='store_true', help='Use log scale for y-axis')
+    parser.add_argument('--signal-dir', default='eot/signal/invisible/mAp_100/dp_ana', help='Directory containing signal ROOT files')
+    parser.add_argument('--background-dir', default='eot/background/inclusive/dp_ana', help='Directory containing background ROOT files')
+    parser.add_argument('--out-dir', default='plots/png', help='Output directory for plots')
+    args = parser.parse_args()
+    
+    # Loop for kinematic variables, save png with distinctable filename
+
+```
+
+</code_interface>
+
+#### Validation Guide
+
+Plot histograms to compare the signal and background kinematic distributions
+
+#### Kinematic Variables
+
+Tree Name: `dp`
+
+| Column Name | Type | Description |
+| --- | --- | --- |
+| TagTrk2_pp | Double_t[] | Reconstructed Tagging Tracker momentum [MeV]. TagTrk2_pp[0] - Leading momentum track |
+| TagTrk2_track_No | Int_t | Number of reconstructed Tagging Tracker tracks |
+| RecTrk2_pp | Double_t[] | Reconstructed Recoil Tracker momentum [MeV]. RecTrk2_pp[0] - Leading momentum track |
+| RecTrk2_track_No | Int_t | Number of reconstructed Recoil Tracker Tracks |
+| ECAL_E_total | vector<double> | Total energy deposited in the ECAL [MeV]. ECAL_E_total[0] - Truth total energy. ECAL_E_total[1] - Smeard total energy with configuration 1. |
+| ECAL_E_max | vector<double> | Maximum energy deposited of the ECAL Cell [MeV]. ECAL_E_max[0] - Truth maximum energy. ECAL_E_max[1] - Smeard maximum energy with configuration 1. |
+| HCAL_E_total | vector<double> | Total energy deposited in the HCAL [MeV]. HCAL_E_total[0] - Truth total energy. HCAL_E_total[1] - Smeard total energy with configuration 1. |
+| HCAL_E_Max_Cell | vector<double> | Maximum energy deposited of the HCAL Cell [MeV]. HCAL_E_Max_Cell[0] - Truth maximum energy. HCAL_E_Max_Cell[1] - Smeard maximum energy with configuration 1. |
+
+### Cut-based Analysis
+
+#### Examples
+
+User: Optimize cut of `ECAL_E_total[0]` with 1 track cut.
+Assistant: <code_interface type="exec" lang="python" filename="optimize_cut.py">
+
+```python
+import ROOT
+import numpy
+import matplotlib.pyplot as plt
+import argparse
+...
+
+def optimize_cut():
+    # Load files
+    ...
+
+    hist_sig = ROOT.TH1F("hist_sig", "", nbins, xmin, xmax)
+    hist_bkg = ROOT.TH1F("hist_bkg", "", nbins, xmin, xmax)
+
+    chain_sig.Draw(f"{cut_var} >> hist_sig", pre_cut)
+    chain_bkg.Draw(f"{cut_var} >> hist_bkg", pre_cut)
+
+    # Integral to a direction
+    for i in range(nbins, 0, -1):
+        cut_val =  hist_sig.GetBinLowEdge(i)
+        s = hist_sig.Integral(i, nbins)
+        b = hist_bkg.Integral(i, nbins)
+        # Calculate `S/sqrt(S+B)` for each cut_val
+        ...
+
+    # Print the cut value, cut efficiency and significance for the optimized cut
+    ...
+
+    # Plot S/sqrt(S+B) vs cut value and the maximum, with clear syle, save to png with distinctble filename
+    ...
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Optimize cut value.')
+    parser.add_argument('cut-var', nargs='?', default='ECAL_E_total[0]', help='Cut variable to optimize')
+    parser.add_argument('--pre-cut', default='...', help='Cuts applied befor current cut var')
+    parser.add_argument('--signal-dir', default='eot/signal/invisible/mAp_100/dp_ana', help='Directory containing signal ROOT files')
+    parser.add_argument('--background-dir', default='eot/background/inclusive/dp_ana', help='Directory containing background ROOT files')
+    args = parser.parse_args()
+    
+    # Optimize cut
+
+```
+
+</code_interface>
+
+#### Cut-based Analysis Steps
+
+1. Define signal region according to physics knowledge
+2. Decide an initial loose cut values for signal region
+3. Optimize cuts to maximize significance
+4. Draw and print cutflow
+5. Recursively optimize cut until the significance is maximized
+   - Vary signal region definition and cut values
+   - Optimize cuts to maximize significance
+   - Draw and print cutflow
+
+#### Guidelines
+
+- If exists multiple signal regions, signal regions should be orthogonal to each other
+- To scan S/sqrt(S+B), please use histogram integral in the loop, which is fast. DO NOT use GetEntries(cut) in a loop, which is extremly slow.
+- Plot using matplotlib, not TGraph.
+"""
+
+    def BESIII_PROMPT(self):
         return ""
 
-    def DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE(self):
+    def GUIDE_PROMPT(self):
+        return """
+## Task:
+
+- You are a independent, patient, careful and accurate assistant, utilizing tools to help user. You analysis the chat history, decide and determine wether to use tool, or simply response to user. You can call tools by using xml node. Available Tools: Code Interface, Web Search, or Knowledge Search.
+
+## Guidelines:
+
+- Analyse the chat history to see if there are any question or task left that are waiting to be solved. Then utilizing tools to solve it.
+- Check if previous tool is finished succesfully, if not, solve it by refine and retry the tool.
+- If there are anything unclear, unexpected, or require validation, make it clear by iteratively use tool, until everything is clear with it's own reference (from tool). **DO NOT make ANY assumptions, DO NOT make-up any reply, DO NOT turn to user for information**.
+- Always aim to deliver meaningful insights, iterating if necessary.
+- All responses should be communicated in the chat's primary language, ensuring seamless understanding.
+"""
+
+    # =========================================================================
+    # Prompts for task model, vision model
+    # ========================================================================= 
+
+    def DEFAULT_QUERY_GENERATION_PROMPT(self):
         return """### Task:
 Analyze the context to determine the necessity of generating search queries, in the given language. By default, **prioritize generating 1-3 broad and relevant search queries** unless it is absolutely certain that no additional information is required. The aim is to retrieve comprehensive, updated, and valuable information even with minimal uncertainty. If no search is unequivocally needed, return an empty list.
 
@@ -1183,4 +1911,7 @@ Strictly return in JSON format:
 {{ item }}
 {% endfor %}
 """
+
+    def VISION_MODEL_PROMPT(self):
+        return """Please briefly explain this figure."""
 
