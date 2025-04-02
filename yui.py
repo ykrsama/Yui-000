@@ -325,7 +325,7 @@ class Pipe:
             user_id, chat_id, message_id = self.extract_event_info(__event_emitter__)
 
             # 初始化知识库
-            collection_ids = await self.init_knowledge(user_id, chat_id)
+            collection_name_ids = await self.init_knowledge(user_id, chat_id)
 
             event_flags: EventFlags = EventFlags()
             session_buffer: SessionBuffer = SessionBuffer(chat_id)
@@ -369,7 +369,7 @@ class Pipe:
             # RAG用户消息
             if messages[-1]["role"] == "user":
                 results = await self.query_collection(
-                    messages[-1]["content"], collection_ids, __event_emitter__
+                    messages[-1]["content"], collection_name_ids, __event_emitter__
                 )
                 for result in results:
                     session_buffer.memory.add_object(result)
@@ -450,8 +450,10 @@ class Pipe:
                         # ======================================================
                         # 更新工具调用情况
                         round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
+                        early_end_round = self.check_early_end_round(round_buffer.tools)
+                        create_new_round = early_end_round
 
-                        if choice.get("finish_reason") or self.check_early_end_round(round_buffer.tools):
+                        if choice.get("finish_reason") or early_end_round:
                             log.info("Finishing chat")
                             self.update_assistant_message(
                                 messages,
@@ -465,9 +467,7 @@ class Pipe:
                             # =================================================
                             # Call tools
                             # =================================================
-                            create_new_round = False
                             if round_buffer.tools:
-                                create_new_round = True
                                 yield f'\n\n<details type="status">\n<summary>Running...</summary>\nRunning\n</details>\n'
                                 user_proxy_reply = ""
                                 for i, tool in enumerate(round_buffer.tools):
@@ -502,7 +502,7 @@ class Pipe:
                                     args=(
                                         session_buffer.rag_result_queue,
                                         [paragraph],
-                                        collection_ids,
+                                        collection_name_ids,
                                         __event_emitter__
                                     ),
                                 )
@@ -562,7 +562,7 @@ class Pipe:
                                         args=(
                                             session_buffer.rag_result_queue,
                                             [paragraph],
-                                            collection_ids,
+                                            collection_name_ids,
                                             __event_emitter__
                                         ),
                                     )
@@ -674,12 +674,12 @@ class Pipe:
 
     async def init_knowledge(self, user_id: str, chat_id: str) -> Dict:
         """
-        初始化知识库数据，将其存储在 collection_ids 字典中。
+        初始化知识库数据，将其存储在 collection_name_ids 字典中。
         :param user_id: 用户ID
         :return: 知识库字典和消息记录文件名称
         """
         log.debug("Initializing knowledge bases")
-        collection_ids: Dict[str, str] = {}  # 初始化知识库字典
+        collection_name_ids: Dict[str, str] = {}  # 初始化知识库字典
         try:
             long_chat_collection_name = f"{self.model_id}-Chat-History-{user_id}"
             long_chat_file_name = f"chat-{self.model_id}-{user_id}-{chat_id}.txt"
@@ -698,7 +698,7 @@ class Pipe:
                     log.info(
                         f"Adding knowledge base: {knowledge_name} ({knowledge.id})"
                     )
-                    collection_ids[knowledge_name] = (
+                    collection_name_ids[knowledge_name] = (
                         knowledge.id  # 将知识库信息存储到字典中
                     )
                     #log.info(knowledge.data)  # output: {'file_ids': [...]}
@@ -719,13 +719,13 @@ class Pipe:
                 )
 
             log.info(
-                f"Loaded {len(collection_ids)} knowledge bases: {list(collection_ids.keys())}"
+                f"Loaded {len(collection_name_ids)} knowledge bases: {list(collection_name_ids.keys())}"
             )
 
         except Exception as e:
             raise Exception(f"Failed to initialize knowledge bases: {str(e)}")
 
-        return collection_ids
+        return collection_name_ids
 
     async def process_message_figures(self, messages, event_emitter: Callable[[dict], Awaitable[None]]):
             # 检查最后一条user消息是否包含图片
@@ -1168,7 +1168,7 @@ class Pipe:
     async def query_collection(
         self,
         query_keywords: List[str],
-        collection_ids: Dict[str, str],
+        collection_name_ids: Dict[str, str],
         event_emitter: Callable[[dict], Awaitable[None]] = None,
         knowledge_names: List[str] = [],
         top_k: int = 1,
@@ -1176,21 +1176,35 @@ class Pipe:
     ) -> list:
         log.debug("Querying Knowledge Collection")
         embeddings = []
+
+        query_keywords = [kwd.strip() for kwd in query_keywords if kwd.strip()]
+        if not query_keywords:
+            log.warning("No keywords to query")
+            return []
+
         if self.valves.GENERATE_KEYWORDS_FROM_MODEL:
-            new_keywords = await self.generate_query_keywords(query_keywords)
+
+            new_knowledge_names, new_keywords = await self.generate_query_keywords(query_keywords, collection_name_ids)
             if new_keywords:
                 query_keywords = new_keywords
             else:
-                log.warning("Fall back to original keywords")
-        query_keywords = [kwd.strip() for kwd in query_keywords if kwd.strip()]
+                # if no keywords, skip search
+                return []
+                #log.warning("Fall back to original keywords")
+
+            if not knowledge_names:
+                knowledge_names = new_knowledge_names
+
+        # default to all collections
+        if not knowledge_names:
+            knowledge_names = collection_name_ids.keys()
 
         if event_emitter:
             await event_emitter(
                 {
                     "type": "status",
                     "data": {
-                        "action": "status",
-                        "description": f'Searching {str(query_keywords)}',
+                        "description": f'Searching {list(knowledge_names)}: {list(query_keywords)}',
                         "done": False,
                     },
                 }
@@ -1206,14 +1220,11 @@ class Pipe:
             if len(query_embeddings) == 0:
                 log.warning(f"Failed to get embedding for queries: {query_keywords}")
                 return []
-            # Get knowledge object
-            if len(knowledge_names) == 0:
-                knowledge_names = collection_ids.keys()
 
             # Search for each knowledge
             all_results = []
             for knowledge_name in knowledge_names:
-                collection_id = collection_ids[knowledge_name]
+                collection_id = collection_name_ids[knowledge_name]
                 log.debug(f"Searching collection: {knowledge_name}")
                 results = await self.search_chroma_db(
                     collection_id, query_embeddings, top_k, max_distance
@@ -1254,8 +1265,7 @@ class Pipe:
                 {
                     "type": "status",
                     "data": {
-                        "action": "status",
-                        "description": f'Searching {str(query_keywords)}',
+                        "description": f'Searching {list(knowledge_names)}: {list(query_keywords)}',
                         "done": True,
                         "hidden": True,
                     },
@@ -1268,7 +1278,7 @@ class Pipe:
         self,
         result_queue: Queue,
         query_keywords: List[str],
-        collection_ids: Dict[str, str],
+        collection_name_ids: Dict[str, str],
         event_emitter: Callable[[dict], Awaitable[None]] = None,
         knowledge_names: List[str] = [],
         top_k: int = 1,
@@ -1277,7 +1287,7 @@ class Pipe:
         try:
             results = asyncio.run(
                 self.query_collection(
-                    query_keywords, collection_ids, event_emitter, knowledge_names, top_k, max_distance
+                    query_keywords, collection_name_ids, event_emitter, knowledge_names, top_k, max_distance
                 )
             )
             if results:
@@ -1310,7 +1320,7 @@ class Pipe:
 
         return None
 
-    async def generate_query_keywords(self, contexts: List):
+    async def generate_query_keywords(self, contexts: List, collection_name_ids):
         """
         Generate query keywords using llm
         """
@@ -1326,7 +1336,11 @@ class Pipe:
         #    short_messages = messages
 
         # Render the template with a list of items
-        replace = {"CURRENT_DATE": formatted_date, "CONTEXTS": contexts}
+        replace = {
+            #"CURRENT_DATE": formatted_date,
+            "CONTEXTS": contexts,
+            "COLLECTION_NAMES": list(collection_name_ids.keys())
+        }
         query_prompt = template.render(**replace)
         task_messages = [{"role": "user", "content": query_prompt}]
         headers = {"Authorization": f"Bearer {self.valves.MODEL_API_KEY}"}
@@ -1346,11 +1360,12 @@ class Pipe:
             data = response.json()
             content = data.get("choices", [{}])[0]["message"]["content"]
             result_json = self.extract_json(content)
+            collection_names = result_json.get("collection_names", [])
             keywords = result_json.get("queries", [])
         except Exception as e:
             log.error(f"Failed to generate query keywords: {e}")
         log.debug(f"Generated query keywords: {keywords}")
-        return keywords
+        return collection_names, keywords
 
     def set_system_prompt(
         self, messages, prompt_templates, session_buffer: SessionBuffer
@@ -1389,7 +1404,7 @@ class Pipe:
         context = {
             "CURRENT_DATE": formatted_date,
             "OP_SYSTEM": session_buffer.code_worker_op_system,
-            "WORKING_MEMORY": str(session_buffer.memory),
+            "WORKING_MEMORY": str(session_buffer.memory)
         }
         result = template.render(**context)
 
@@ -2103,8 +2118,10 @@ Analyze the context to determine the necessity of generating search queries, in 
 
 ### Guidelines:
 - Respond **EXCLUSIVELY** with a JSON object. Any form of extra commentary, explanation, or additional text is strictly prohibited.
-- When generating search queries, respond in the format: { "queries": ["query1", "query2"] }, ensuring each query is distinct, concise, and relevant to the topic.
+- Available collection names: {{COLLECTION_NAMES}}
+- When generating search queries, respond in the format: { "collection_names": ["CollectionName"], "queries": ["query1", "query2"] }, ensuring each query is distinct, concise, and relevant to the topic and ensure each collection name is possibly relevant.
 - If and only if it is entirely certain that no useful results can be retrieved by a search, return: { "queries": [] }.
+- If not sure which collection to search, return: { "collection_names": [] }.
 - Err on the side of suggesting search queries if there is **any chance** they might provide useful or updated information.
 - Be concise and focused on composing high-quality search queries, avoiding unnecessary elaboration, commentary, or assumptions.
 - Always prioritize providing actionable and broad queries that maximize informational coverage.
@@ -2112,7 +2129,8 @@ Analyze the context to determine the necessity of generating search queries, in 
 ### Output:
 Strictly return in JSON format: 
 {
-  "queries": ["query1", "query2"]
+  "collection_names": ["Collection A", "Collection B"],
+  "queries": ["query1", "query2", "query3"]
 }
 
 ### Contexts
