@@ -1348,6 +1348,7 @@ class Pipe:
             "model": self.valves.TASK_MODEL,
             "messages": task_messages,
         }
+        collection_names = []
         keywords = []
         try:
             response = requests.post(
