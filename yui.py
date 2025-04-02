@@ -599,7 +599,7 @@ class Pipe:
 
         # If no matches found, return None
         if not matches:
-            return None
+            return []
 
         for match in matches:
             # Extract the tag name, attributes, and content
@@ -2107,7 +2107,6 @@ Analyze the context to determine the necessity of generating search queries, in 
 - If and only if it is entirely certain that no useful results can be retrieved by a search, return: { "queries": [] }.
 - Err on the side of suggesting search queries if there is **any chance** they might provide useful or updated information.
 - Be concise and focused on composing high-quality search queries, avoiding unnecessary elaboration, commentary, or assumptions.
-- Today's date is: {{CURRENT_DATE}}.
 - Always prioritize providing actionable and broad queries that maximize informational coverage.
 
 ### Output:
