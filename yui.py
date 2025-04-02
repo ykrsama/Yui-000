@@ -176,7 +176,6 @@ class EventFlags:
     """
     def __init__(self):
         self.thinking_state: int = 0
-        self.early_end_round = False
         self.mem_updated = False
 
 
@@ -449,7 +448,10 @@ class Pipe:
                         # ======================================================
                         # 结束条件判断
                         # ======================================================
-                        if choice.get("finish_reason") or event_flags.early_end_round:
+                        # 更新工具调用情况
+                        round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
+
+                        if choice.get("finish_reason") or self.check_early_end_round(round_buffer.tools):
                             log.info("Finishing chat")
                             self.update_assistant_message(
                                 messages,
@@ -540,12 +542,6 @@ class Pipe:
                                 event_flags,
                                 prefix_reasoning=True,
                             )
-
-                            # 检查工具调用情况
-                            round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
-                            if round_buffer.tools:
-                               self.check_early_end_round(round_buffer.tools)
-                               event_flags.early_end_round = True
 
                             if do_semantic_segmentation:
                                 # 根据语义分割段落
