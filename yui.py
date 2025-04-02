@@ -1186,7 +1186,7 @@ class Pipe:
                 query_keywords = new_keywords
             else:
                 log.warning("Fall back to original keywords")
-        query_keywords = [kwd.strip() for kwd in query_keywords]
+        query_keywords = [kwd.strip() for kwd in query_keywords if kwd.strip()]
 
         if event_emitter:
             await event_emitter(
