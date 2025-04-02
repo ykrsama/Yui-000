@@ -359,7 +359,7 @@ class Pipe:
             # 预处理消息（规范化、解析图片）
             # ==================================================================
             # TODO
-            # self.process_message_figures(messages)
+            await self.process_message_figures(messages, __event_emitter__)
             # User proxy转移到User 角色以保护身份认同
             await self.transfer_userproxy_role(messages)
             # 处理消息以防止相同的角色
@@ -635,8 +635,68 @@ class Pipe:
 
         return collection_ids
 
-    async def process_message_figures(self):
-        pass
+    async def process_message_figures(self, messages, event_emitter):
+            # 检查最后一条user消息是否包含图片
+            log.debug("Checking last user message for images")
+            if messages[-1]["role"] == "user":
+                content = messages[-1]["content"]
+                if isinstance(content, List):
+                    text_content = ""
+                    # 查找文字内容
+                    for c in content:
+                        if c.get("type", "") == "text":
+                            text_content = c.get("text", "")
+                            log.debug(
+                                f"Found text in last user message: {text_content}"
+                            )
+                            break
+
+                    # 查找图片内容
+                    for c in content:
+                        if c.get("type", "") == "image_url":
+                            log.debug("Found image in last user message")
+                            image_url = c.get("image_url", {}).get("url", "")
+                            if image_url:
+                                if image_url.startswith("data:image"):
+                                    log.debug("Image URL is a data URL")
+                                else:
+                                    log.debug(f"Image URL: {image_url}")
+                                # Query vision language model
+                                vision_summary = await self.query_vision_model(
+                                    self.VISION_MODEL_PROMPT(), [image_url], event_emitter
+                                )
+                                # insert to message content
+                                text_content += vision_summary
+                    # 替换消息
+                    messages[-1]["content"] = text_content
+                else:
+                    image_urls = self.extract_image_urls(content)
+                    if image_urls:
+                        log.debug(f"Found image in last user message: {image_urls}")
+                        # Call Vision Language Model
+                        vision_summary = await self.query_vision_model(
+                            self.VISION_MODEL_PROMPT(), image_urls, event_emitter
+                        )
+                        messages[-1]["content"] += vision_summary
+
+            # 确保user message是text-only
+            log.debug("Checking all user messages content format")
+            for msg in messages:
+                if msg["role"] == "user":
+                    content = msg["content"]
+                    if isinstance(content, List):
+                        log.debug("Found a list of content in user message")
+                        text_content = ""
+                        # 查找文字内容
+                        for c in content:
+                            if c.get("type", "") == "text":
+                                text_content = c.get("content", "")
+                                log.debug(f"Found text in user message: {text_content}")
+                                break
+
+                        # 替换消息
+                        log.debug("Replacing user message content")
+                        msg["content"] = text_content
 
     async def transfer_userproxy_role(self, messages):
         log.info("Transferring user proxy messages to user role")
@@ -1524,7 +1584,15 @@ class Pipe:
         self,
         prompt: str,
         image_urls: List[str],
+        event_emitter=None,
     ) -> str:
+        if event_emitter:
+            await event_emitter(
+                        {
+                            "type": "status", # We set the type here
+                            "data": {"description": "Using Vision Model", "done": False, "hidden": False},
+                        }
+                    )
         # Batch logging directory-style URLs first
         for idx, url in enumerate(image_urls, 1):
             if not url.startswith("data:image"):
@@ -1549,7 +1617,13 @@ class Pipe:
             ]
             batch_results = await asyncio.gather(*tasks)
             results.extend(batch_results)
-    
+        if event_emitter:
+            await event_emitter(
+                        {
+                            "type": "status", # We set the type here
+                            "data": {"description": "Using Vision Model", "done": True, "hidden": True},
+                        }
+                    )
         # Format ordered response
         return "\n\n".join(
             f"**Figure {idx}:** {res}" 
