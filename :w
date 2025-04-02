@@ -1179,6 +1179,19 @@ class Pipe:
         max_distance: float = 0,
     ) -> list:
         log.debug("Querying Knowledge Collection")
+        if event_emitter:
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "query_collection",
+                        "description": f'Searching str(query_keywords)',
+                        "query": str(query_keywords),
+                        "done": False,
+                    },
+                }
+            )
+
         embeddings = []
         if self.valves.GENERATE_KEYWORDS_FROM_MODEL:
             new_keywords = await self.generate_query_keywords(query_keywords)
@@ -1187,19 +1200,6 @@ class Pipe:
             else:
                 log.warning("Fall back to original keywords")
         query_keywords = [kwd.strip() for kwd in query_keywords]
-
-        if event_emitter:
-            await event_emitter(
-                {
-                    "type": "status",
-                    "data": {
-                        "action": "status",
-                        "description": f'Searching {str(query_keywords)}',
-                        "done": False,
-                    },
-                }
-            )
-
         if len(query_keywords) == 0:
             log.warning("No keywords to query")
             return []
@@ -1216,6 +1216,7 @@ class Pipe:
 
             # Search for each knowledge
             all_results = []
+            sources = []
             for knowledge_name in knowledge_names:
                 collection_id = collection_ids[knowledge_name]
                 log.debug(f"Searching collection: {knowledge_name}")
@@ -1225,28 +1226,24 @@ class Pipe:
                 if not results:
                     continue
                 all_results.extend(results)
-
-                if event_emitter:
-                    for obj in results:
-                        content = obj.document
-                        title = obj.metadata.get("source", "Unknown").replace("~", "/")
-                        await event_emitter(
-                            {
-                                "type": "citation",
-                                "data": {
-                                    "document": [content],
-                                    "metadata": [
-                                        {
-                                            "date_accessed": datetime.now().isoformat(),
-                                            "source": title,
-                                        }
-                                    ],
-                                    "source": {"name": title},
-                                },
-                            }
-                        )
+                for obj in results:
+                    source = obj.metadata.get("source", "Unknown").replace("~", "/")
+                    sources.append(source)
 
             log.debug(f"Search done with {len(all_results)} results")
+
+            if event_emitter:
+                await event_emitter(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "query_collection",
+                            "description": f"Searched {len(sources)} items",
+                            "urls": sources,
+                            "done": True,
+                        },
+                    }
+                )
 
             return all_results
 
@@ -1258,10 +1255,9 @@ class Pipe:
                 {
                     "type": "status",
                     "data": {
-                        "action": "status",
-                        "description": f'Searching {str(query_keywords)}',
+                        "action": "query_collection",
+                        "description": "Searched 0 items",
                         "done": True,
-                        "hidden": True,
                     },
                 }
             )
