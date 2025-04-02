@@ -451,9 +451,9 @@ class Pipe:
                         # 更新工具调用情况
                         round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
                         early_end_round = self.check_early_end_round(round_buffer.tools)
-                        create_new_round = early_end_round
 
                         if choice.get("finish_reason") or early_end_round:
+                            create_new_round = early_end_round
                             log.info("Finishing chat")
                             self.update_assistant_message(
                                 messages,
