@@ -20,6 +20,7 @@ from queue import Queue
 from jinja2 import Template
 from datetime import datetime
 from dataclasses import dataclass
+from open_webui.models.files import FileForm
 from open_webui.utils.misc import (
     add_or_update_user_message,
 )
@@ -1233,25 +1234,25 @@ class Pipe:
                     continue
                 all_results.extend(results)
 
-                if event_emitter:
-                    for obj in results:
-                        content = obj.document
-                        title = obj.metadata.get("source", "Unknown").replace("~", "/")
-                        await event_emitter(
-                            {
-                                "type": "citation",
-                                "data": {
-                                    "document": [content],
-                                    "metadata": [
-                                        {
-                                            "date_accessed": datetime.now().isoformat(),
-                                            "source": title,
-                                        }
-                                    ],
-                                    "source": {"name": title},
-                                },
-                            }
-                        )
+                #if event_emitter:
+                #    for obj in results:
+                #        content = obj.document
+                #        title = obj.metadata.get("source", "Unknown").replace("~", "/")
+                #        await event_emitter(
+                #            {
+                #                "type": "citation",
+                #                "data": {
+                #                    "document": [content],
+                #                    "metadata": [
+                #                        {
+                #                            "date_accessed": datetime.now().isoformat(),
+                #                            "source": title,
+                #                        }
+                #                    ],
+                #                    "source": {"name": title},
+                #                },
+                #            }
+                #        )
 
             log.debug(f"Search done with {len(all_results)} results")
 
@@ -1367,6 +1368,32 @@ class Pipe:
             log.error(f"Failed to generate query keywords: {e}")
         log.debug(f"Generated query keywords: {keywords}")
         return collection_names, keywords
+
+
+    def estimate_tokens(text: str) -> int:
+        return len(text) // 4  # Simple approximation
+
+    async def archive_history(history: list, user_id: str, chat_id: str):
+        content = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history])
+        filename = f"chat-history-{user_id}-{chat_id}.txt"
+
+        try:
+            # Create file record
+            file_form = FileForm(
+                filename=filename,
+                data={"content": content},
+                meta={"name": filename}
+            )
+            file = Files.insert_file(file_form, user_id)
+
+            # Add to long-term chat knowledge base
+            collection_name = f"{self.model_id}-Chat-History-{user_id}"
+            knowledge = Knowledges.get_knowledge_by_name(user_id, collection_name)
+            if knowledge:
+                Knowledges.add_file_to_knowledge(knowledge.id, file.id)
+
+        except Exception as e:
+            log.error(f"History archival failed: {e}")
 
     def set_system_prompt(
         self, messages, prompt_templates, session_buffer: SessionBuffer
