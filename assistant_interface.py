@@ -1,3 +1,5 @@
+```
+<update_assistant_interface>
 import logging
 import io, sys, os
 import json
@@ -35,79 +37,8 @@ from open_webui.models.files import Files, FileForm
 from hepai import HRModel
 import numpy as np
 
-
-class ManagedThread(threading.Thread):
-    """
-    Managed thread class for automatic removal from manager when thread ends
-    """
-
-    def __init__(self, manager, target, args, kwargs):
-        super().__init__(target=target, args=args, kwargs=kwargs)
-        self.manager = manager  # 持有管理器实例的引用
-
-    def run(self):
-        try:
-            super().run()  # 执行目标函数
-        except Exception as e:
-            log.error(f"Thread error: {e}")
-        finally:
-            self.manager.remove_thread(self)  # 确保无论是否异常都执行移除操作
-
-
-class ThreadManager:
-    """
-    Thread manager class
-    """
-
-    def __init__(self):
-        self.threads = []  # 存储活跃线程的容器
-        self.lock = threading.Lock()  # 保证线程安全的锁
-
-    def submit(self, target, args=(), kwargs=None):
-        """提交新线程到线程池"""
-        if kwargs is None:
-            kwargs = {}
-
-        # 创建托管线程实例
-        thread = ManagedThread(self, target, args, kwargs)
-
-        # 使用锁保证线程安全地添加线程
-        with self.lock:
-            self.threads.append(thread)
-
-        thread.start()  # 注意：先添加后启动保证移除操作有效性
-
-    def remove_thread(self, thread):
-        """从容器中移除已完成的线程"""
-        with self.lock:
-            if thread in self.threads:
-                self.threads.remove(thread)
-
-    def join_all(self):
-        """等待所有线程执行完成"""
-        # 复制当前线程列表避免遍历时修改
-        with self.lock:
-            current_threads = list(self.threads)
-
-        for thread in current_threads:
-            thread.join()  # 等待每个线程完成
-
-    def active_count(self):
-        """获取当前活跃线程数量"""
-        with self.lock:
-            return len(self.threads)
-
-
-@dataclass
-class VectorDBResultObject:
-    """
-    Vector DB search result object
-    """
-    id_: str
-    distance: float
-    document: str
-    metadata: Dict
-    query_embedding: List
+sys.path.append("/Users/xuliang/third_party")
+from assistant_utils.tools import ManagedThread, ThreadManager, extract_json
 
 
 class WorkingMemory:
@@ -206,7 +137,8 @@ class RoundBuffer:
 
 class Assistant:
     def __init__(self, valves):
-        self.valves = self.Valves()
+        self.model_id = "Yui-000"
+        self.valves = valves
         self.data_prefix = "data: "
         self.rag_thread_max = 1
 
@@ -263,7 +195,6 @@ class Assistant:
             # ==================================================================
             # 预处理消息（规范化、解析图片）
             # ==================================================================
-            # TODO
             await self.process_message_figures(messages, __event_emitter__)
             # User proxy转移到User 角色以保护身份认同
             await self.transfer_userproxy_role(messages)
@@ -325,7 +256,6 @@ class Assistant:
                             result = session_buffer.rag_result_queue.get()
                             for result_object in result:
                                 session_buffer.memory.add_object(result_object)
-                            # TODO 更新工作记忆
                             event_flags.mem_updated = True
     
                         # 判断是否打断当前生成并进入下一轮
@@ -1124,26 +1054,6 @@ class Assistant:
                     continue
                 all_results.extend(results)
 
-                #if event_emitter:
-                #    for obj in results:
-                #        content = obj.document
-                #        title = obj.metadata.get("source", "Unknown").replace("~", "/")
-                #        await event_emitter(
-                #            {
-                #                "type": "citation",
-                #                "data": {
-                #                    "document": [content],
-                #                    "metadata": [
-                #                        {
-                #                            "date_accessed": datetime.now().isoformat(),
-                #                            "source": title,
-                #                        }
-                #                    ],
-                #                    "source": {"name": title},
-                #                },
-                #            }
-                #        )
-
             log.debug(f"Search done with {len(all_results)} results")
 
             return all_results
@@ -1187,29 +1097,6 @@ class Assistant:
         except Exception as e:
             log.error(f"Error querying collection to queue: {e}")
 
-    def extract_json(self, content):
-        # 匹配 ```json 块中的 JSON
-        json_block_pattern = r"```json\s*({.*?})\s*```"
-        # 匹配 ``` 块中的 JSON
-        block_pattern = r"```\s*({.*?})\s*```"
-        #log.debug(f"Content: {content}")
-        try:
-            # 尝试匹配 ```json 块
-            match = re.search(json_block_pattern, content, re.DOTALL)
-            if match:
-                return json.loads(match.group(1))
-
-            # 尝试匹配 ``` 块
-            match = re.search(block_pattern, content, re.DOTALL)
-            if match:
-                return json.loads(match.group(1))
-
-            # 尝试直接转换
-            return json.loads(content)
-        except Exception as e:
-            log.error(f"Failed to extract JSON: {e}")
-
-        return None
 
     async def generate_query_keywords(self, contexts: List, collection_name_ids):
         """
@@ -1251,7 +1138,7 @@ class Assistant:
             response.raise_for_status()
             data = response.json()
             content = data.get("choices", [{}])[0]["message"]["content"]
-            result_json = self.extract_json(content)
+            result_json = extract_json(content)
             collection_names = result_json.get("collection_names", [])
             keywords = result_json.get("queries", [])
         except Exception as e:
@@ -2060,3 +1947,5 @@ Strictly return in JSON format:
     def VISION_MODEL_PROMPT(self):
         return """Please briefly explain this figure."""
 
+</update_assistant_interface>
+```

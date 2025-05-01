@@ -163,28 +163,30 @@ class Pipe:
                 namespace = globals().copy()
                 # Execute the extracted code within the local_vars context
                 exec(assistant_code_block, namespace)
-                yield "1"
-                Assistant = namespace['Assistant']
-                yield "2"
-                agent = Assistant(self.valves)
-                yield "3"
-                if not agent:
-                    yield "No assistant source found in the user message"
+                if "Assistant" not in namespace:
+                    yield "\nError: Assistant class not found in the assistant interface code"
                     return
-                if callable(agent.interface):
-                    # Call the interface function with the provided arguments
-                    result = agent.interface(body, __event_emitter__)
-                    if isinstance(result, AsyncGenerator):
-                        async for item in result:
-                            yield item
-                    else:
-                        yield result
-                else:
-                    yield "No callable function found in the assistant source"
 
-                yield "\nAssistant source executed"
+                Assistant = namespace['Assistant']
+                agent = Assistant(self.valves)
+                if not agent:
+                    yield "Error: Failed to create Assistant instance"
+                    return
+
+                if not callable(agent.interface):
+                    yield "\nError: No callable function interface() found in the assistant source"
+                    return
+
+                # Call the interface function with the provided arguments
+                result = agent.interface(body, __event_emitter__)
+                if isinstance(result, AsyncGenerator):
+                    async for item in result:
+                        yield item
+                else:
+                    yield result
+                
             else:
-                yield "\nNo assistant source found in the user message"
+                yield "\nError: No assistant source found in the message"
 
         except Exception as e:
             yield self._format_error("Exception", str(e))
