@@ -1,6 +1,7 @@
+```xml
 <update_assistant_interface>
 
-```
+```python
 sys.path.append("/Users/xuliang/third_party")
 from assistant_utils.tools import ManagedThread, ThreadManager, extract_json, oai_chat_completion
 
@@ -32,5 +33,5 @@ class Assistant:
             if content:
                 yield content
 ```
-
 </update_assistant_interface>
+```

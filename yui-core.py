@@ -148,45 +148,51 @@ class Pipe:
             "Content-Type": "application/json",
         }
         try:
-            payload = {**body, "model": self.valves.BASE_MODEL}
-            messages = payload["messages"]
+            messages = body["messages"]
             assistant_code_block = ""
-            # 1. Extract the code block from the message
+
+            log.info("Extracting assistant code block...")
             for i in range(len(messages) - 1, -1, -1):
                 message = messages[i]["content"]
                 code_blocks = re.findall(r'<update_assistant_interface>(.*?)</update_assistant_interface>', message, re.DOTALL)
                 if code_blocks:
                     assistant_code_block = self.strip_triple_backtick(code_blocks[-1])
                     break
-            # 2. Evaluate the extracted function with input variables: body, __event_emitter
-            if assistant_code_block:
-                namespace = globals().copy()
-                # Execute the extracted code within the local_vars context
-                exec(assistant_code_block, namespace)
-                if "Assistant" not in namespace:
-                    yield "\nError: Assistant class not found in the assistant interface code"
-                    return
-
-                Assistant = namespace['Assistant']
-                agent = Assistant(self.valves)
-                if not agent:
-                    yield "Error: Failed to create Assistant instance"
-                    return
-
-                if not callable(agent.interface):
-                    yield "\nError: No callable function interface() found in the assistant source"
-                    return
-
-                # Call the interface function with the provided arguments
-                result = agent.interface(body, __event_emitter__)
-                if isinstance(result, AsyncGenerator):
-                    async for item in result:
-                        yield item
+            if not assistant_code_block:
+                log.warning("Fallback to load from default_interface.py")
+                default_interface_path = os.path.expanduser("~/third_party/assistant_utils/default_interface.py")
+                if os.path.exists(default_interface_path):
+                    with open(default_interface_path, 'r') as file:
+                        assistant_code_block = file.read()
                 else:
-                    yield result
-                
+                    yield "\nError: Default interface file not found"
+                    return
+    
+            log.info("Evaluating assistant code block")
+            namespace = globals().copy()
+            # Execute the extracted code within the local_vars context
+            exec(assistant_code_block, namespace)
+            if "Assistant" not in namespace:
+                yield "\nError: Assistant class not found in the assistant interface code"
+                return
+
+            Assistant = namespace['Assistant']
+            agent = Assistant(self.valves)
+            if not agent:
+                yield "Error: Failed to create Assistant instance"
+                return
+
+            if not callable(agent.interface):
+                yield "\nError: No callable function interface() found in the assistant source"
+                return
+
+            # Call the interface function with the provided arguments
+            result = agent.interface(body, __event_emitter__)
+            if isinstance(result, AsyncGenerator):
+                async for item in result:
+                    yield item
             else:
-                yield "\nError: No assistant source found in the message"
+                yield result
 
         except Exception as e:
             yield self._format_error("Exception", str(e))
