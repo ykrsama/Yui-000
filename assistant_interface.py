@@ -1,5 +1,6 @@
-```
 <update_assistant_interface>
+
+```
 import logging
 import io, sys, os
 import json
@@ -1834,6 +1835,6 @@ Strictly return in JSON format:
 
     def VISION_MODEL_PROMPT(self):
         return """Please briefly explain this figure."""
+```
 
 </update_assistant_interface>
-```

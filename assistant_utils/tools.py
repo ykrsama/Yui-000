@@ -232,16 +232,16 @@ async def oai_chat_completion(model: str,
             yield {"error": f"[OAI Chat Completion] Error: {e}"}
 
 
-    def strip_triple_backtick(text: str) -> str:
-        """
-        Strips triple backticks from the text.
-        """
-        text = text.strip()
-        if text.startswith("```") and text.endswith("```"):
-            # Remove the first line and the last line (markdown code block)
-            lines = text.splitlines()
-            if len(lines) > 1:
-                lines = lines[1:-1]
-            text = "\n".join(lines)
-        return text
+def strip_triple_backtick(text: str) -> str:
+    """
+    Strips triple backticks from the text.
+    """
+    text = text.strip()
+    if text.startswith("```") and text.endswith("```"):
+        # Remove the first line and the last line (markdown code block)
+        lines = text.splitlines()
+        if len(lines) > 1:
+            lines = lines[1:-1]
+        text = "\n".join(lines)
+    return text
 

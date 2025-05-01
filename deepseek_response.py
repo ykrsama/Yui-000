@@ -1,4 +1,6 @@
 <update_assistant_interface>
+
+```
 sys.path.append("/Users/xuliang/third_party")
 from assistant_utils.tools import ManagedThread, ThreadManager, extract_json, oai_chat_completion
 
@@ -29,5 +31,6 @@ class Assistant:
             content = choice.get("delta", {}).get("content", "")
             if content:
                 yield content
+```
 
 </update_assistant_interface>
