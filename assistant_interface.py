@@ -38,7 +38,7 @@ from hepai import HRModel
 import numpy as np
 
 sys.path.append("/Users/xuliang/third_party")
-from assistant_utils.tools import ManagedThread, ThreadManager, extract_json
+from assistant_utils.tools import ManagedThread, ThreadManager, extract_json, oai_chat_completion
 
 
 class WorkingMemory:

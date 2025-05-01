@@ -2,13 +2,14 @@
 import logging
 import json
 import os
-from typing import List, Dict, Optional
+from typing import AsyncGenerator, Callable, Awaitable, Optional, Dict, List, Tuple
 from dataclasses import dataclass, asdict
 import re
 import numpy as np
 import asyncio
 import threading
 from queue import Queue
+import httpx
 
 log = logging.getLogger(__name__)
 
@@ -169,3 +170,54 @@ def extract_json(content):
 
     return None
 
+async def oai_chat_completion(model: str,
+                              url: str,
+                              api_key: str,
+                              body: dict) -> AsyncGenerator[dict, None]:
+    
+        headers = {
+            "Authorization": f"Bearer {self.valves.MODEL_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        # Initialize client
+        client = httpx.AsyncClient(
+            http2=True,
+            timeout=None,
+        )
+        payload = {**body, "model": self.valves.BASE_MODEL}
+        try:
+            async with client.stream(
+                "POST",
+                f"{self.valves.MODEL_API_BASE_URL}/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=None,
+            ) as response:
+                # 流式处理响应
+                async for line in response.aiter_lines():
+                    if not line.startswith(self.data_prefix):
+                        continue
+
+                    json_str = line[len(self.data_prefix) :]
+
+                    # 去除首尾空格后检查是否为结束标记
+                    if json_str.strip() == "[DONE]":
+                        return
+
+                    try:
+                        data = json.loads(json_str)
+                    except json.JSONDecodeError as e:
+                        error_detail = f"[OAI Chat Completion] Error: failed to extract：{json_str}，Reason：{e}"
+                        yield {"error": error_detail}
+                        return
+
+                    choice = data.get("choices", [{}])[0]
+
+                    # 结束条件判断
+                    if choice.get("finish_reason"):
+                        break
+
+                    yield choice
+        except Exception as e:
+            yield {"error": f"[OAI Chat Completion] Error: {e}"}
