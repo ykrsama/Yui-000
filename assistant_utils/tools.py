@@ -174,9 +174,10 @@ async def oai_chat_completion(model: str,
                               url: str,
                               api_key: str,
                               body: dict) -> AsyncGenerator[dict, None]:
-    
+        data_prefix="data: "
+        
         headers = {
-            "Authorization": f"Bearer {self.valves.MODEL_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
 
@@ -185,21 +186,29 @@ async def oai_chat_completion(model: str,
             http2=True,
             timeout=None,
         )
-        payload = {**body, "model": self.valves.BASE_MODEL}
+        payload = {**body, "model": model}
         try:
             async with client.stream(
                 "POST",
-                f"{self.valves.MODEL_API_BASE_URL}/chat/completions",
+                f"{url}/chat/completions",
                 json=payload,
                 headers=headers,
                 timeout=None,
             ) as response:
+                # 错误处理
+                if response.status_code != 200:
+                    error = await response.aread()
+                    error_str = error.decode(errors="ignore")
+                    err_msg = json.loads(error_str).get("message", error_str)[:200]
+                    yield {"error": f"{status_code}: {err_msg}"}
+                    return
+
                 # 流式处理响应
                 async for line in response.aiter_lines():
-                    if not line.startswith(self.data_prefix):
+                    if not line.startswith(data_prefix):
                         continue
 
-                    json_str = line[len(self.data_prefix) :]
+                    json_str = line[len(data_prefix) :]
 
                     # 去除首尾空格后检查是否为结束标记
                     if json_str.strip() == "[DONE]":
@@ -221,3 +230,18 @@ async def oai_chat_completion(model: str,
                     yield choice
         except Exception as e:
             yield {"error": f"[OAI Chat Completion] Error: {e}"}
+
+
+    def strip_triple_backtick(text: str) -> str:
+        """
+        Strips triple backticks from the text.
+        """
+        text = text.strip()
+        if text.startswith("```") and text.endswith("```"):
+            # Remove the first line and the last line (markdown code block)
+            lines = text.splitlines()
+            if len(lines) > 1:
+                lines = lines[1:-1]
+            text = "\n".join(lines)
+        return text
+

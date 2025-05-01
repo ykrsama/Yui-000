@@ -156,7 +156,7 @@ class Pipe:
                 message = messages[i]["content"]
                 code_blocks = re.findall(r'<update_assistant_interface>(.*?)</update_assistant_interface>', message, re.DOTALL)
                 if code_blocks:
-                    assistant_code_block = code_blocks[-1]
+                    assistant_code_block = self.strip_triple_backtick(code_blocks[-1])
                     break
             # 2. Evaluate the extracted function with input variables: body, __event_emitter
             if assistant_code_block:
@@ -205,3 +205,16 @@ class Pipe:
         return json.dumps(
             {"error": f"{status_code}: {err_msg}"}, ensure_ascii=False
         )
+
+    def strip_triple_backtick(self, text: str) -> str:
+        """
+        Strips triple backticks from the text.
+        """
+        text = text.strip()
+        if text.startswith("```") and text.endswith("```"):
+            # Remove the first line and the last line (markdown code block)
+            lines = text.splitlines()
+            if len(lines) > 1:
+                lines = lines[1:-1]
+            text = "\n".join(lines)
+        return text
