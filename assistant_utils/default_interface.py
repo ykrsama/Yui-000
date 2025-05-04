@@ -720,6 +720,7 @@ class Assistant:
         """更新助手消息"""
         total_response = round_buffer.total_response
         if not prefix_reasoning:
+            log.debug("Removing prefix reasoning")
             pattern = r"<think>\n\n(.*?)\n</think>\n\n"
             match = re.search(pattern, round_buffer.total_response, re.DOTALL)
             if match:
@@ -1352,9 +1353,9 @@ class Assistant:
         self,
         prompt: str,
         image_url: str,
-        model: str = "Qwen/Qwen2-VL-72B-Instruct",
-        url: str = "https://api.siliconflow.cn/v1",
-        key: str = "",
+        model: str,
+        url: str,
+        key: str,
     ) -> str:
         try:
             payload = {
@@ -1478,7 +1479,7 @@ class Assistant:
                 self.generate_vl_response(
                     prompt=prompt,
                     image_url=url,
-                    model="ark/doubao-vision-pro",
+                    model=self.valves.VISION_MODEL,
                     url=self.valves.MODEL_API_BASE_URL,
                     key=self.valves.MODEL_API_KEY,
                 )
