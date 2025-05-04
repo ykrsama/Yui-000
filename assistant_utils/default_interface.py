@@ -318,69 +318,69 @@ class Assistant:
                                     ),
                                 )
 
-                    if finishing_chat:
-                        log.info("Finishing chat")
-                        finishing_chat = False
-                        create_new_round = early_end_round
-                        round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
-                        self.update_assistant_message(
-                            messages,
-                            round_buffer,
-                            event_flags,
-                            prefix_reasoning=False,
-                        )
-                        paragraph = await self.finalize_sentences(
-                            session_buffer, round_buffer
-                        )
-                        # =================================================
-                        # Call tools
-                        # =================================================
-                        if round_buffer.tools:
-                            yield f'\n\n<details type="status">\n<summary>Running...</summary>\nRunning\n</details>\n'
-                            user_proxy_reply = ""
-                            for i, tool in enumerate(round_buffer.tools):
-                                if i > 0:
-                                    await asyncio.sleep(0.1)
-                                summary, content = await TOOL[tool["name"]](
-                                    session_buffer, tool["attributes"], tool["content"]
+                if finishing_chat:
+                    log.info("Finishing chat")
+                    finishing_chat = False
+                    create_new_round = early_end_round
+                    round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
+                    self.update_assistant_message(
+                        messages,
+                        round_buffer,
+                        event_flags,
+                        prefix_reasoning=False,
+                    )
+                    paragraph = await self.finalize_sentences(
+                        session_buffer, round_buffer
+                    )
+                    # =================================================
+                    # Call tools
+                    # =================================================
+                    if round_buffer.tools:
+                        yield f'\n\n<details type="status">\n<summary>Running...</summary>\nRunning\n</details>\n'
+                        user_proxy_reply = ""
+                        for i, tool in enumerate(round_buffer.tools):
+                            if i > 0:
+                                await asyncio.sleep(0.1)
+                            summary, content = await TOOL[tool["name"]](
+                                session_buffer, tool["attributes"], tool["content"]
+                            )
+    
+                            # Check for image urls
+                            image_urls = self.extract_image_urls(content)
+    
+                            if image_urls:
+                                figure_summary = await self.query_vision_model(
+                                    self.VISION_MODEL_PROMPT(), image_urls, __event_emitter__
                                 )
+                                content += figure_summary
+                            
+                            user_proxy_reply += f"{summary}\n\n{content}\n\n"
+                            yield f'\n<details type="user_proxy">\n<summary>{summary}</summary>\n{content}\n</details>\n'
+                        # Update user proxy message
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": user_proxy_reply,
+                            }
+                        )
     
-                                # Check for image urls
-                                image_urls = self.extract_image_urls(content)
+                    if paragraph:
+                        session_buffer.rag_thread_mgr.submit(
+                            self.query_collection_to_queue,
+                            args=(
+                                session_buffer.rag_result_queue,
+                                [paragraph],
+                                collection_name_ids,
+                                __event_emitter__
+                            ),
+                        )
     
-                                if image_urls:
-                                    figure_summary = await self.query_vision_model(
-                                        self.VISION_MODEL_PROMPT(), image_urls, __event_emitter__
-                                    )
-                                    content += figure_summary
-                                
-                                user_proxy_reply += f"{summary}\n\n{content}\n\n"
-                                yield f'\n<details type="user_proxy">\n<summary>{summary}</summary>\n{content}\n</details>\n'
-                            # Update user proxy message
-                            messages.append(
-                                {
-                                    "role": "user",
-                                    "content": user_proxy_reply,
-                                }
-                            )
-    
-                        if paragraph:
-                            session_buffer.rag_thread_mgr.submit(
-                                self.query_collection_to_queue,
-                                args=(
-                                    session_buffer.rag_result_queue,
-                                    [paragraph],
-                                    collection_name_ids,
-                                    __event_emitter__
-                                ),
-                            )
-    
-                        log.debug(messages[1:])
-                        log.debug(f"Current round: {round_count}, create_new_round: {create_new_round}")
+                    log.debug(messages[1:])
+                    log.debug(f"Current round: {round_count}, create_new_round: {create_new_round}")
 
-                        # Reset varaiables
-                        round_buffer.reset()
-                        round_count += 1
+                    # Reset varaiables
+                    round_buffer.reset()
+                    round_count += 1
 
                 log.debug(messages[1:])
 
