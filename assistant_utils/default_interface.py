@@ -239,12 +239,13 @@ class Assistant:
                 )
 
                 create_new_round = False
-                finishing_chat = False
+                finishing_chat = True
 
                 async for choices in choices_stream:
                     if "error" in choices:
                         yield json.dumps({"error": choices["error"]}, ensure_ascii=False)
                         create_new_round = False
+                        finishing_chat = False
                         break
                     # ======================================================
                     # 提前结束条件判断
@@ -260,6 +261,7 @@ class Assistant:
                     if self.check_refresh_round(session_buffer, event_flags):
                         log.debug("Breaking chat round")
                         create_new_round = True
+                        finishing_chat = False
                         round_buffer.prefix_mode = True
                         break
    
@@ -317,10 +319,10 @@ class Assistant:
                                         __event_emitter__
                                     ),
                                 )
+                    finishing_chat = True
 
                 if finishing_chat:
                     log.info("Finishing chat")
-                    finishing_chat = False
                     create_new_round = early_end_round
                     round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
                     self.update_assistant_message(
