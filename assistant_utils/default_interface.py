@@ -238,6 +238,8 @@ class Assistant:
                     body=body
                 )
 
+                create_new_round = False
+
                 async for choices in choices_stream:
                     if "error" in choices:
                         yield json.dumps({"error": choices["error"]}, ensure_ascii=False)
@@ -268,8 +270,8 @@ class Assistant:
                     early_end_round = self.check_early_end_round(round_buffer.tools)
     
                     if choices.get("finish_reason") or early_end_round:
-                        create_new_round = early_end_round
                         log.info("Finishing chat")
+                        create_new_round = early_end_round
                         self.update_assistant_message(
                             messages,
                             round_buffer,
@@ -322,9 +324,11 @@ class Assistant:
                                 ),
                             )
     
+                        log.debug(messages[1:])
+                        log.debug(f"Current round: {round_count}, create_new_round: {create_new_round}")
+
                         # Reset varaiables
                         round_buffer.reset()
-                        log.debug(f"Current round: {round_count}, create_new_round: {create_new_round}")
                         round_count += 1
                         break
    
@@ -372,7 +376,6 @@ class Assistant:
                                     ),
                                 )
 
-                create_new_round = False
                 log.debug(messages[1:])
 
             log.info("Chat finished succesfully.")
