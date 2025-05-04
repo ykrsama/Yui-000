@@ -131,8 +131,15 @@ class Pipe:
 
             log.info("Extracting assistant code block...")
             for i in range(len(messages) - 1, -1, -1):
-                message = messages[i]["content"]
-                code_blocks = re.findall(r'<update_assistant_core>(.*?)</update_assistant_core>', message, re.DOTALL)
+                content = messages[i]["content"]
+                content_text = content
+                if isinstance(content, List):
+                    for c in content:
+                        if c.get("type", "") == "text":
+                            content_text = c.get("text", "")
+                            break
+
+                code_blocks = re.findall(r'<update_assistant_core>(.*?)</update_assistant_core>', content_text, re.DOTALL)
                 if code_blocks:
                     assistant_code_block = self.strip_triple_backtick(code_blocks[-1])
                     break
@@ -202,3 +209,4 @@ class Pipe:
                 lines = lines[1:-1]
             text = "\n".join(lines)
         return text
+

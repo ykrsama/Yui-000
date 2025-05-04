@@ -259,7 +259,6 @@ class Assistant:
             # 获取请求参数
             payload = {**body, "model": self.valves.BASE_MODEL}
             messages = payload["messages"]
-            log.debug(f"Body: {body}")
     
             # ==================================================================
             # 预处理消息（规范化、解析图片）
@@ -1498,6 +1497,7 @@ class Assistant:
         key: str = "",
     ) -> str:
         try:
+            log.debug(f"Connecting Vision Model")
             payload = {
                 "model": model,
                 "messages": [
