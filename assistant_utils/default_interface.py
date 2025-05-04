@@ -239,6 +239,7 @@ class Assistant:
                 )
 
                 create_new_round = False
+                finishing_chat = False
 
                 async for choices in choices_stream:
                     if "error" in choices:
@@ -270,8 +271,58 @@ class Assistant:
                     early_end_round = self.check_early_end_round(round_buffer.tools)
     
                     if choices.get("finish_reason") or early_end_round:
+                        finishing_chat = True
+                        break
+   
+                    do_semantic_segmentation = False
+                    if self.valves.REALTIME_RAG:
+                        do_semantic_segmentation = True
+                    if self.valves.REALTIME_IO and self.is_answering(round_buffer.total_response):
+                        do_semantic_segmentation = True
+                    # ======================================================
+                    # 内容处理
+                    # ======================================================
+                    content = self.process_content(
+                        choices.get("delta", {}), round_buffer, event_flags
+                    )
+                    if content:
+                        yield content
+                        self.update_assistant_message(
+                            messages,
+                            round_buffer,
+                            event_flags,
+                            prefix_reasoning=True,
+                        )
+    
+                        if do_semantic_segmentation:
+                            # 根据语义分割段落
+                            sentence_n = await self.update_sentence_buffer(
+                                content, round_buffer
+                            )
+                            if sentence_n == 0:
+                                continue
+                            new_paragraphs = await self.semantic_segmentation(
+                                sentence_n, round_buffer
+                            )
+                            if len(new_paragraphs) == 0:
+                                continue
+                            # 实时RAG搜索
+                            for paragraph in new_paragraphs:
+                                session_buffer.rag_thread_mgr.submit(
+                                    self.query_collection_to_queue,
+                                    args=(
+                                        session_buffer.rag_result_queue,
+                                        [paragraph],
+                                        collection_name_ids,
+                                        __event_emitter__
+                                    ),
+                                )
+
+                    if finishing_chat:
                         log.info("Finishing chat")
+                        finishing_chat = False
                         create_new_round = early_end_round
+                        round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
                         self.update_assistant_message(
                             messages,
                             round_buffer,
@@ -330,51 +381,6 @@ class Assistant:
                         # Reset varaiables
                         round_buffer.reset()
                         round_count += 1
-                        break
-   
-                    do_semantic_segmentation = False
-                    if self.valves.REALTIME_RAG:
-                        do_semantic_segmentation = True
-                    if self.valves.REALTIME_IO and self.is_answering(round_buffer.total_response):
-                        do_semantic_segmentation = True
-                    # ======================================================
-                    # 内容处理
-                    # ======================================================
-                    content = self.process_content(
-                        choices.get("delta", {}), round_buffer, event_flags
-                    )
-                    if content:
-                        yield content
-                        self.update_assistant_message(
-                            messages,
-                            round_buffer,
-                            event_flags,
-                            prefix_reasoning=True,
-                        )
-    
-                        if do_semantic_segmentation:
-                            # 根据语义分割段落
-                            sentence_n = await self.update_sentence_buffer(
-                                content, round_buffer
-                            )
-                            if sentence_n == 0:
-                                continue
-                            new_paragraphs = await self.semantic_segmentation(
-                                sentence_n, round_buffer
-                            )
-                            if len(new_paragraphs) == 0:
-                                continue
-                            # 实时RAG搜索
-                            for paragraph in new_paragraphs:
-                                session_buffer.rag_thread_mgr.submit(
-                                    self.query_collection_to_queue,
-                                    args=(
-                                        session_buffer.rag_result_queue,
-                                        [paragraph],
-                                        collection_name_ids,
-                                        __event_emitter__
-                                    ),
-                                )
 
                 log.debug(messages[1:])
 
@@ -715,22 +721,17 @@ class Assistant:
         messages,
         round_buffer,
         event_flags: EventFlags,
-        prefix_reasoning: bool = False,
+        prefix_reasoning: bool = True,
     ):
         """更新助手消息"""
-        total_response = round_buffer.total_response
         if not prefix_reasoning:
             log.debug("Removing prefix reasoning")
             pattern = r"<think>\n\n(.*?)\n</think>\n\n"
-            match = re.search(pattern, round_buffer.total_response, re.DOTALL)
-            if match:
-                total_response = re.sub(
-                    pattern, "", round_buffer.total_response, count=1
-                )
+            round_buffer.total_response = re.sub(pattern, '', round_buffer.total_response, flags=re.DOTALL)
 
         assistante_message = {
             "role": "assistant",
-            "content": total_response,
+            "content": round_buffer.total_response,
             "prefix": True,
         }
 
