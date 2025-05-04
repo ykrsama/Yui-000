@@ -331,6 +331,8 @@ class Assistant:
     
                         # 判断是否打断当前生成并进入下一轮
                         if self.check_refresh_round(session_buffer, event_flags):
+                            log.debug("Breaking chat round")
+                            create_new_round = True
                             round_buffer.prefix_mode = True
                             break
     
@@ -464,6 +466,8 @@ class Assistant:
                                             __event_emitter__
                                         ),
                                     )
+
+                        create_new_round = False
     
         except Exception as e:
             log.error(f"Error in assistant interface: {e}")
