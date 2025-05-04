@@ -213,7 +213,7 @@ class Assistant:
                     session_buffer.memory.add_object(result)
     
             log.debug("Old message:")
-            log.debug(messages[1:])
+            log.debug(messages)
     
             # ==================================================================
             # 发起API请求
