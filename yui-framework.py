@@ -15,33 +15,7 @@ import requests
 from typing import AsyncGenerator, Callable, Awaitable, Optional, Dict, List, Tuple
 from pydantic import BaseModel, Field
 import asyncio
-import threading
-from queue import Queue
-from jinja2 import Template
 from datetime import datetime
-from dataclasses import dataclass
-from open_webui.models.files import FileForm
-from open_webui.utils.misc import (
-    add_or_update_user_message,
-)
-from open_webui.models.messages import (
-    Messages,
-    MessageModel,
-    MessageResponse,
-    MessageForm,
-)
-from open_webui.retrieval.vector.connector import VECTOR_DB_CLIENT
-from langchain_core.documents import Document
-from open_webui.models.knowledge import (
-    Knowledges,
-    KnowledgeForm,
-    KnowledgeResponse,
-    KnowledgeUserResponse,
-    KnowledgeUserModel,
-)
-from open_webui.models.files import Files, FileForm
-from hepai import HRModel
-import numpy as np
 
 log = logging.getLogger(__name__)
 log.setLevel("DEBUG")
@@ -66,6 +40,10 @@ class Pipe:
         TASK_MODEL: str = Field(
             default="deepseek-ai/deepseek-v3:671b",
             description="用于提取搜索提示词等的模型名称",
+        )
+        VISION_MODEL: str = Field(
+            default="ark/doubao-vision-pro",
+            description="用语解析图片内容",
         )
         EMBEDDING_API_BASE_URL: str = Field(
             default="http://127.0.0.1:11434/v1",

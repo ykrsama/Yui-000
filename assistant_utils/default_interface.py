@@ -35,15 +35,79 @@ from open_webui.models.files import Files, FileForm
 from hepai import HRModel
 import numpy as np
 
-sys.path.append("/Users/xuliang/third_party")
-from assistant_utils.tools import (
-        ManagedThread,
-        ThreadManager,
-        VectorDBResultObject,
-        oai_chat_completion,
-        extract_json,
-        strip_triple_backtick,
-)
+
+class ManagedThread(threading.Thread):
+    """
+    Managed thread class for automatic removal from manager when thread ends
+    """
+
+    def __init__(self, manager, target, args, kwargs):
+        super().__init__(target=target, args=args, kwargs=kwargs)
+        self.manager = manager  # 持有管理器实例的引用
+
+    def run(self):
+        try:
+            super().run()  # 执行目标函数
+        except Exception as e:
+            log.error(f"Thread error: {e}")
+        finally:
+            self.manager.remove_thread(self)  # 确保无论是否异常都执行移除操作
+
+
+class ThreadManager:
+    """
+    Thread manager class
+    """
+
+    def __init__(self):
+        self.threads = []  # 存储活跃线程的容器
+        self.lock = threading.Lock()  # 保证线程安全的锁
+
+    def submit(self, target, args=(), kwargs=None):
+        """提交新线程到线程池"""
+        if kwargs is None:
+            kwargs = {}
+
+        # 创建托管线程实例
+        thread = ManagedThread(self, target, args, kwargs)
+
+        # 使用锁保证线程安全地添加线程
+        with self.lock:
+            self.threads.append(thread)
+
+        thread.start()  # 注意：先添加后启动保证移除操作有效性
+
+    def remove_thread(self, thread):
+        """从容器中移除已完成的线程"""
+        with self.lock:
+            if thread in self.threads:
+                self.threads.remove(thread)
+
+    def join_all(self):
+        """等待所有线程执行完成"""
+        # 复制当前线程列表避免遍历时修改
+        with self.lock:
+            current_threads = list(self.threads)
+
+        for thread in current_threads:
+            thread.join()  # 等待每个线程完成
+
+    def active_count(self):
+        """获取当前活跃线程数量"""
+        with self.lock:
+            return len(self.threads)
+
+
+@dataclass
+class VectorDBResultObject:
+    """
+    Vector DB search result object
+    """
+    id_: str
+    distance: float
+    document: str
+    metadata: Dict
+    query_embedding: List
 
 
 class WorkingMemory:
@@ -142,10 +206,10 @@ class RoundBuffer:
 
 class Assistant:
     def __init__(self, valves):
-        self.model_id = "Yui-000"
         self.valves = valves
         self.data_prefix = "data: "
         self.rag_thread_max = 1
+        self.model_id = "Yui-000"
 
     async def interface(
         self, body: dict, __event_emitter__: Callable[[dict], Awaitable[None]] = None
@@ -154,7 +218,11 @@ class Assistant:
         if not self.valves.MODEL_API_KEY:
             yield json.dumps({"error": "未配置API密钥"}, ensure_ascii=False)
             return
-
+        # 准备请求参数
+        headers = {
+            "Authorization": f"Bearer {self.valves.MODEL_API_KEY}",
+            "Content-Type": "application/json",
+        }
         try:
             # ==================================================================
             # 初始化变量
@@ -168,6 +236,12 @@ class Assistant:
             event_flags: EventFlags = EventFlags()
             session_buffer: SessionBuffer = SessionBuffer(chat_id)
             round_buffer: RoundBuffer = RoundBuffer()
+    
+            # Initialize client
+            client = httpx.AsyncClient(
+                http2=True,
+                timeout=None,
+            )
     
             # Initialize tools
             TOOL = {}
@@ -183,10 +257,14 @@ class Assistant:
                 TOOL["web_search"] = self.web_search
                 prompt_templates["web_search"] = self.DEFAULT_WEB_SEARCH_PROMPT()
     
+            # 获取请求参数
+            payload = {**body, "model": self.valves.BASE_MODEL}
+            messages = payload["messages"]
+    
             # ==================================================================
             # 预处理消息（规范化、解析图片）
             # ==================================================================
-            messages = body["messages"]
+            # TODO
             await self.process_message_figures(messages, __event_emitter__)
             # User proxy转移到User 角色以保护身份认同
             await self.transfer_userproxy_role(messages)
@@ -203,7 +281,7 @@ class Assistant:
                     session_buffer.memory.add_object(result)
     
             log.debug("Old message:")
-            log.debug(messages[1:])
+            log.debug(messages)
     
             # ==================================================================
             # 发起API请求
@@ -211,6 +289,7 @@ class Assistant:
             create_new_round = True
             round_count = 0
             while create_new_round and round_count < self.valves.MAX_LOOP:
+    
                 # RAG队列大于阈值时等待，再继续下一轮
                 if session_buffer.rag_thread_mgr.active_count() > self.rag_thread_max:
                     await asyncio.sleep(0.1)
@@ -219,144 +298,111 @@ class Assistant:
                 # 更新系统提示词
                 self.set_system_prompt(messages, prompt_templates, session_buffer)
     
-                log.info(f"Starting chat round {round_count}")
-
-                choices_stream = oai_chat_completion(
-                    model=self.valves.BASE_MODEL,
-                    url=self.valves.MODEL_API_BASE_URL,
-                    api_key=self.valves.MODEL_API_KEY,
-                    body=body
-                )
-
-                async for choices in choices_stream:
-                    # ======================================================
-                    # 提前结束条件判断
-                    # ======================================================
-                    # 检查rag结果队列
-                    while not session_buffer.rag_result_queue.empty():
-                        result = session_buffer.rag_result_queue.get()
-                        for result_object in result:
-                            session_buffer.memory.add_object(result_object)
-                        event_flags.mem_updated = True
+                log.debug(messages[1:])
+                log.info("Starting chat round")
     
-                    # 判断是否打断当前生成并进入下一轮
-                    if self.check_refresh_round(session_buffer, event_flags):
-                        log.debug("Breaking chat round")
-                        create_new_round = True
-                        break
-   
-                    # ======================================================
-                    # 结束条件判断
-                    # ======================================================
-                    # 更新工具调用情况
-                    round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
-                    early_end_round = self.check_early_end_round(round_buffer.tools)
+                async with client.stream(
+                    "POST",
+                    f"{self.valves.MODEL_API_BASE_URL}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                    timeout=None,
+                ) as response:
+                    # 错误处理
+                    if response.status_code != 200:
+                        error = await response.aread()
+                        yield self._format_error(response.status_code, error)
+                        return
     
-                    if choices.get("finish_reason") or early_end_round:
-                        create_new_round = early_end_round
-                        log.info("Finishing chat")
-                        self.update_assistant_message(
-                            messages,
-                            round_buffer,
-                            event_flags,
-                            prefix_reasoning=False,
-                        )
-                        paragraph = await self.finalize_sentences(
-                            session_buffer, round_buffer
-                        )
-                        # =================================================
-                        # Call tools
-                        # =================================================
-                        if round_buffer.tools:
-                            yield f'\n\n<details type="status">\n<summary>Running...</summary>\nRunning\n</details>\n'
-                            user_proxy_reply = ""
-                            for i, tool in enumerate(round_buffer.tools):
-                                if i > 0:
-                                    await asyncio.sleep(0.1)
-                                summary, content = await TOOL[tool["name"]](
-                                    session_buffer, tool["attributes"], tool["content"]
+                    # 流式处理响应
+                    async for line in response.aiter_lines():
+                        if not line.startswith(self.data_prefix):
+                            continue
+                        # ======================================================
+                        # 提前结束条件判断
+                        # ======================================================
+                        # 检查rag结果队列
+                        while not session_buffer.rag_result_queue.empty():
+                            result = session_buffer.rag_result_queue.get()
+                            for result_object in result:
+                                session_buffer.memory.add_object(result_object)
+                            # TODO 更新工作记忆
+                            event_flags.mem_updated = True
+    
+                        # 判断是否打断当前生成并进入下一轮
+                        if self.check_refresh_round(session_buffer, event_flags):
+                            break
+    
+                        # ======================================================
+                        # 解析数据
+                        # ======================================================
+                        json_str = line[len(self.data_prefix) :]
+    
+                        # 去除首尾空格后检查是否为结束标记
+                        if json_str.strip() == "[DONE]":
+                            return
+    
+                        try:
+                            data = json.loads(json_str)
+                        except json.JSONDecodeError as e:
+                            error_detail = f"解析失败 - 内容：{json_str}，原因：{e}"
+                            yield self._format_error("JSONDecodeError", error_detail)
+                            return
+    
+                        choice = data.get("choices", [{}])[0]
+    
+                        # ======================================================
+                        # 结束条件判断
+                        # ======================================================
+                        # 更新工具调用情况
+                        round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
+                        early_end_round = self.check_early_end_round(round_buffer.tools)
+    
+                        if choice.get("finish_reason") or early_end_round:
+                            create_new_round = early_end_round
+                            log.info("Finishing chat")
+                            self.update_assistant_message(
+                                messages,
+                                round_buffer,
+                                event_flags,
+                                prefix_reasoning=False,
+                            )
+                            paragraph = await self.finalize_sentences(
+                                session_buffer, round_buffer
+                            )
+                            # =================================================
+                            # Call tools
+                            # =================================================
+                            if round_buffer.tools:
+                                yield f'\n\n<details type="status">\n<summary>Running...</summary>\nRunning\n</details>\n'
+                                user_proxy_reply = ""
+                                for i, tool in enumerate(round_buffer.tools):
+                                    if i > 0:
+                                        await asyncio.sleep(0.1)
+                                    summary, content = await TOOL[tool["name"]](
+                                        session_buffer, tool["attributes"], tool["content"]
+                                    )
+    
+                                    # Check for image urls
+                                    image_urls = self.extract_image_urls(content)
+    
+                                    if image_urls:
+                                        figure_summary = await self.query_vision_model(
+                                            self.VISION_MODEL_PROMPT(), image_urls, __event_emitter__
+                                        )
+                                        content += figure_summary
+                                    
+                                    user_proxy_reply += f"{summary}\n\n{content}\n\n"
+                                    yield f'\n<details type="user_proxy">\n<summary>{summary}</summary>\n{content}\n</details>\n'
+                                # Update user proxy message
+                                messages.append(
+                                    {
+                                        "role": "user",
+                                        "content": user_proxy_reply,
+                                    }
                                 )
     
-                                # Check for image urls
-                                image_urls = self.extract_image_urls(content)
-    
-                                if image_urls:
-                                    figure_summary = await self.query_vision_model(
-                                        self.VISION_MODEL_PROMPT(), image_urls, __event_emitter__
-                                    )
-                                    content += figure_summary
-                                
-                                user_proxy_reply += f"{summary}\n\n{content}\n\n"
-                                yield f'\n<details type="user_proxy">\n<summary>{summary}</summary>\n{content}\n</details>\n'
-                            # Update user proxy message
-                            messages.append(
-                                {
-                                    "role": "user",
-                                    "content": user_proxy_reply,
-                                }
-                            )
-    
-                        if paragraph:
-                            session_buffer.rag_thread_mgr.submit(
-                                self.query_collection_to_queue,
-                                args=(
-                                    session_buffer.rag_result_queue,
-                                    [paragraph],
-                                    collection_name_ids,
-                                    __event_emitter__
-                                ),
-                            )
-    
-                        # Reset varaiables
-                        round_buffer.reset()
-                        round_count += 1
-                        log.debug(f"Current round: {round_count}, create_new_round: {create_new_round}")
-                        break
-                    # ======================================================
-                    # 思考状态处理
-                    # ======================================================
-                    state_output = await self.update_thinking_state(
-                        choices.get("delta", {}), event_flags
-                    )
-                    if state_output:
-                        yield state_output  # 直接发送状态标记
-    
-                    do_semantic_segmentation = False
-                    if self.valves.REALTIME_RAG:
-                        do_semantic_segmentation = True
-                    if self.valves.REALTIME_IO and self.is_answering(
-                        event_flags.thinking_state
-                    ):
-                        do_semantic_segmentation = True
-                    # ======================================================
-                    # 内容处理
-                    # ======================================================
-                    content = self.process_content(
-                        choices.get("delta", {}), round_buffer, event_flags
-                    )
-                    if content:
-                        yield content
-                        self.update_assistant_message(
-                            messages,
-                            round_buffer,
-                            event_flags,
-                            prefix_reasoning=True,
-                        )
-    
-                        if do_semantic_segmentation:
-                            # 根据语义分割段落
-                            sentence_n = await self.update_sentence_buffer(
-                                content, round_buffer
-                            )
-                            if sentence_n == 0:
-                                continue
-                            new_paragraphs = await self.semantic_segmentation(
-                                sentence_n, round_buffer
-                            )
-                            if len(new_paragraphs) == 0:
-                                continue
-                            # 实时RAG搜索
-                            for paragraph in new_paragraphs:
+                            if paragraph:
                                 session_buffer.rag_thread_mgr.submit(
                                     self.query_collection_to_queue,
                                     args=(
@@ -366,11 +412,68 @@ class Assistant:
                                         __event_emitter__
                                     ),
                                 )
-
-                    create_new_round = False
-
-            log.info("Chat finished succesfully.")
-
+    
+                            # Reset varaiables
+                            round_buffer.reset()
+                            round_count += 1
+                            log.debug(messages[1:])
+                            log.debug(f"Current round: {round_count}, create_new_round: {create_new_round}, finish_reason: {choice.get('finish_reason')}, early_end_round: {early_end_round}")
+                            break
+                        # ======================================================
+                        # 思考状态处理
+                        # ======================================================
+                        state_output = await self.update_thinking_state(
+                            choice.get("delta", {}), event_flags
+                        )
+                        if state_output:
+                            yield state_output  # 直接发送状态标记
+    
+                        do_semantic_segmentation = False
+                        if self.valves.REALTIME_RAG:
+                            do_semantic_segmentation = True
+                        if self.valves.REALTIME_IO and self.is_answering(
+                            event_flags.thinking_state
+                        ):
+                            do_semantic_segmentation = True
+                        # ======================================================
+                        # 内容处理
+                        # ======================================================
+                        content = self.process_content(
+                            choice["delta"], round_buffer, event_flags
+                        )
+                        if content:
+                            yield content
+                            self.update_assistant_message(
+                                messages,
+                                round_buffer,
+                                event_flags,
+                                prefix_reasoning=True,
+                            )
+    
+                            if do_semantic_segmentation:
+                                # 根据语义分割段落
+                                sentence_n = await self.update_sentence_buffer(
+                                    content, round_buffer
+                                )
+                                if sentence_n == 0:
+                                    continue
+                                new_paragraphs = await self.semantic_segmentation(
+                                    sentence_n, round_buffer
+                                )
+                                if len(new_paragraphs) == 0:
+                                    continue
+                                # 实时RAG搜索
+                                for paragraph in new_paragraphs:
+                                    session_buffer.rag_thread_mgr.submit(
+                                        self.query_collection_to_queue,
+                                        args=(
+                                            session_buffer.rag_result_queue,
+                                            [paragraph],
+                                            collection_name_ids,
+                                            __event_emitter__
+                                        ),
+                                    )
+    
         except Exception as e:
             log.error(f"Error in assistant interface: {e}")
             yield json.dumps({"error": str(e)}, ensure_ascii=False)
@@ -677,8 +780,6 @@ class Assistant:
         """
         state_output = ""
 
-        # log.debug(f"Thinking state old: {event_flags.thinking_state}, delta: {delta}")
-
         # 状态转换：未开始 -> 思考中
         if event_flags.thinking_state == 0 and delta.get("reasoning_content"):
             # 0 -> 1
@@ -698,8 +799,6 @@ class Assistant:
         elif event_flags.thinking_state == 4 and delta.get("content"):
             # 4 -> 0
             event_flags.thinking_state = 0
-
-        # log.debug(f"Thinking state new: {event_flags.thinking_state}")
 
         return state_output
 
@@ -756,7 +855,7 @@ class Assistant:
         prefix_reasoning: bool = False,
     ):
         """更新助手消息"""
-        if prefix_reasoning:
+        if prefix_reasoning and round_buffer.reasoning_content:
             if round_buffer.total_response:
                 assistante_message = {
                     "role": "assistant",
@@ -1022,6 +1121,26 @@ class Assistant:
                     continue
                 all_results.extend(results)
 
+                #if event_emitter:
+                #    for obj in results:
+                #        content = obj.document
+                #        title = obj.metadata.get("source", "Unknown").replace("~", "/")
+                #        await event_emitter(
+                #            {
+                #                "type": "citation",
+                #                "data": {
+                #                    "document": [content],
+                #                    "metadata": [
+                #                        {
+                #                            "date_accessed": datetime.now().isoformat(),
+                #                            "source": title,
+                #                        }
+                #                    ],
+                #                    "source": {"name": title},
+                #                },
+                #            }
+                #        )
+
             log.debug(f"Search done with {len(all_results)} results")
 
             return all_results
@@ -1065,6 +1184,29 @@ class Assistant:
         except Exception as e:
             log.error(f"Error querying collection to queue: {e}")
 
+    def extract_json(self, content):
+        # 匹配 ```json 块中的 JSON
+        json_block_pattern = r"```json\s*({.*?})\s*```"
+        # 匹配 ``` 块中的 JSON
+        block_pattern = r"```\s*({.*?})\s*```"
+        #log.debug(f"Content: {content}")
+        try:
+            # 尝试匹配 ```json 块
+            match = re.search(json_block_pattern, content, re.DOTALL)
+            if match:
+                return json.loads(match.group(1))
+
+            # 尝试匹配 ``` 块
+            match = re.search(block_pattern, content, re.DOTALL)
+            if match:
+                return json.loads(match.group(1))
+
+            # 尝试直接转换
+            return json.loads(content)
+        except Exception as e:
+            log.error(f"Failed to extract JSON: {e}")
+
+        return None
 
     async def generate_query_keywords(self, contexts: List, collection_name_ids):
         """
@@ -1106,7 +1248,7 @@ class Assistant:
             response.raise_for_status()
             data = response.json()
             content = data.get("choices", [{}])[0]["message"]["content"]
-            result_json = extract_json(content)
+            result_json = self.extract_json(content)
             collection_names = result_json.get("collection_names", [])
             keywords = result_json.get("queries", [])
         except Exception as e:
@@ -1157,6 +1299,13 @@ class Assistant:
             template_string += "\n## Available Tools\n"
             for i, (name, prompt) in enumerate(prompt_templates.items()):
                 template_string += f"\n### {i+1}. {prompt}\n"
+
+        # Physics Guides
+        if self.valves.USE_DARKSHINE_GUIDE:
+            template_string += self.DARKSHINE_PROMPT()
+
+        if self.valves.USE_BESIII_GUIDE:
+            template_string += self.BESIII_PROMPT()
 
         # Task Prompt
         template_string += self.GUIDE_PROMPT()
@@ -1210,7 +1359,16 @@ class Assistant:
         code_type = attributes.get("type", "")
         lang = attributes.get("lang", "")
         filename = attributes.get("filename", "")
-        content = strip_triple_backtick(content)
+
+        # Remove the first line and the last line (markdown code block)
+        lines = content.strip().splitlines()
+        if len(lines) <= 2:
+            return (
+                "Error: Too few lines to extract code",
+                "Check if you have code in markdown code block",
+            )
+        lines = lines[1:-1]
+        content = "\n".join(lines)
 
         if code_type == "exec":
             # Execute the code
@@ -1519,7 +1677,7 @@ class Assistant:
                 self.generate_vl_response(
                     prompt=prompt,
                     image_url=url,
-                    model="ark/doubao-vision-pro",
+                    model=self.valves.VISION_MODEL,
                     url=self.valves.MODEL_API_BASE_URL,
                     key=self.valves.MODEL_API_KEY,
                 )
@@ -1549,13 +1707,10 @@ class Assistant:
 
 You have access to a user's {{OP_SYSTEM}} computer workspace. You use `<code_interface>` XML tag to write codes to do analysis, calculations, or problem-solving.
 
-[example begin]
+#### Examples
 
-EXAMPLE INPUT:
-plot something
-
-EXAMPLE OUTPUT:
-<code_interface type="exec" lang="python" filename="plot.py">
+User: plot something
+Assistant: <code_interface type="exec" lang="python" filename="plot.py">
 
 ```python
 # plot and save png figure to a relative path
@@ -1563,11 +1718,10 @@ EXAMPLE OUTPUT:
 
 </code_interface>
 
-EXAMPLE INPUT:
-Create and test a simple cmake project named HelloWorld
+---
 
-EXAMPLE OUTPUT:
-<code_interface type="write" lang="cmake" filename="HelloWorld/CMakeList.txt">
+User: Create and test a simple cmake project named HelloWorld
+Assistant: <code_interface type="write" lang="cmake" filename="HelloWorld/CMakeList.txt">
 
 ```cmake
 ...
@@ -1597,8 +1751,6 @@ make
 
 </code_interface>
 
-[example end]
-
 #### Tool Attributes
 
 - `type`: Specifies the action to perform.
@@ -1616,7 +1768,6 @@ make
 - An **extra line break** is always needed **between the `<code_interface>` XML tag and markdown code block**.
 - Use the `<code_interface>` XML node and stop right away to wait for user's action.
 - Only one code block is allowd in one `<code_interface>` XML node. DO NOT use two or more markdown code blocks together.
-- Please do not unnecessarily remove any comments or code.
 - Coding style instruction:
   - **Always aim to give meaningful outputs** (e.g., results, tables, summaries, or visuals) to better interpret and verify the findings. Avoid relying on implicit outputs; prioritize explicit and clear print statements so the results are effectively communicated to the user.
    - Run in batch mode. Save figures to png.
@@ -1648,6 +1799,214 @@ second query
 - Be concise and focused on composing high-quality search query, **avoiding unnecessary elaboration, commentary, or assumptions**.
 - **The date today is: {{CURRENT_DATE}}**. So you can search for web to get information up do date {{CURRENT_DATE}}.
 """
+
+
+    def DARKSHINE_PROMPT(self):
+        return """
+## DarkSHINE Physics Analysis Guide:
+
+### Introduction
+
+DarkSHINE Experiment is a fixed-target experiment to search for dark photons (A') produced in 8 GeV electron-on-target (EOT) collisions. The experiment is designed to detect the invisible decay of dark photons, which escape the detector with missing energy and missing momentum. The DarkSHINE detector consists of Tagging Tracker, Target, Recoil Tracker, Electromagnetic Calorimeter (ECAL), Hadronic Calorimeter (HCAL).
+
+The Target is a thin plate (~350 um) of Tungsten.
+
+Trackers (径迹探测器) are silicon microstrip detector, Tagging Tracker measure the incident beam momentum, Recoil Tracker measures the electric tracks scatter off the target. Missing momentum can be calculated by TagTrk2_pp[0] - RecTrk2_pp[0]
+
+ECAL (电磁量能器) is cubics of LYSO crystal scintillator cells, with high energy precision.
+
+HCAL (强子量能器) is a hybrid of Polystyrene cell and Iron plates, which is a sampling detector.
+
+Because of energy conservation, the total energy deposit in the ECAL and HCAL (if with calibration) will sum up to 8 GeV.
+
+Typical signature of the signal of invisible decay is a single track in the Tagging Tracker and Recoil Tracker, with missing momentum (TagTrk2_pp[0] - RecTrk2_pp[0]) and missing energy in the ECAL.
+
+Bremstruhlung events results in missing momentum, but small missing energy in the ECAL.
+
+Usually SM electron-nuclear or photon-nuclear process will create multiple tracks in the recoil tracker, thus not mis identified as signal, but still are a ratio of events passing the track number selection, and with MIP particles in the final states, becoming background. They can be veto by the HCAL with a HCAL Max Cell Energy cut (signal region defined by HCAL Max Cell energy lower than some value e.g. 1 MeV).
+
+Process with neutrino will be irreducible background, however with ignorable branching ratio.
+
+### Simulation and Reconstruction
+
+#### Examples
+
+User: For DarkSHINE, simulate and reconstruct inclusive background events
+Assistant: <code_interface type="exec" lang="bash" filename="background_inclusive_eot.sh">
+
+```bash
+#!/bin/bash
+
+# Set the original config file directory
+dsimu_script_dir="/opt/darkshine-simulation/source/DP_simu/scripts"
+default_yaml="$dsimu_script_dir/default.yaml"
+magnet_file="$dsimu_script_dir/magnet_0.75_20240521.root"
+
+echo "-- Preparing simulation config"
+sed "s:  mag_field_input\::  mag_field_input\: \"${magnet_file}\"  \#:" $default_yaml > default.yaml
+
+echo "-- Running simulation and output to dp_simu.root"
+DSimu -y default.yaml -b 100 -f dp_simu.root > simu.out 2> simu.err
+
+echo "-- Preparing reconstruction config (default input dp_simu.root and output dp_ana.root)"
+DAna -x > config.txt
+
+echo "-- Running reconstruction and output to dp_ana.root"
+DAna -c config.txt
+
+echo "All done!"
+```
+
+</code_interface>
+
+#### Simulation and Reconstruction Steps
+
+1. Configure the beam parameters and detector geometries for the simulation setup
+2. Signal simulation and reconstruction
+   1. Decide the free parameters to scan according to the signal model
+   2. Simulate signal events
+      1. Prepare config file
+      2. Run simulation program
+         - DSimu: DarkSHINE MC event generator
+         - boss.exe: BESIII MC event generator
+   3. Reconstruct the signal events.
+      1. Prepare config file
+      2. Run reconstruction program
+         - DAna: DarkSHINE reconstruction program
+         - boss.exe: BESIII reconstruction program
+3. Background simulation and reconstruction
+   1. Configure the physics process for background events
+   2. Simulate background events
+   3. Reconstruct background events
+
+### Validation
+
+#### Examples
+
+User: Compare varaibles of signal and background events
+Assistant: <code_interface type="exec" lang="python" filename="compare_kinematics.py">
+
+```python
+import ROOT
+import numpy
+import matplotlib.pyplot as plt
+import argparse
+from pathlib import Path
+...
+
+def compare(column: str, fig_name: str):
+    # create output dir if not exists
+    # load files
+    # draw histogram with pre_selection and column
+    # overlay histograms of signal and background
+    # save to png
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Compare kinematics of signal and background events.')
+    parser.add_argument('--pre-selection', default='', help='Pre-selection to apply')
+    parser.add_argument('--log-scale', action='store_true', help='Use log scale for y-axis')
+    parser.add_argument('--signal-dir', default='eot/signal/invisible/mAp_100/dp_ana', help='Directory containing signal ROOT files')
+    parser.add_argument('--background-dir', default='eot/background/inclusive/dp_ana', help='Directory containing background ROOT files')
+    parser.add_argument('--out-dir', default='plots/png', help='Output directory for plots')
+    args = parser.parse_args()
+    
+    # Loop for kinematic variables, save png with distinctable filename
+
+```
+
+</code_interface>
+
+#### Validation Guide
+
+Plot histograms to compare the signal and background kinematic distributions
+
+#### Kinematic Variables
+
+Tree Name: `dp`
+
+| Column Name | Type | Description |
+| --- | --- | --- |
+| TagTrk2_pp | Double_t[] | Reconstructed Tagging Tracker momentum [MeV]. TagTrk2_pp[0] - Leading momentum track |
+| TagTrk2_track_No | Int_t | Number of reconstructed Tagging Tracker tracks |
+| RecTrk2_pp | Double_t[] | Reconstructed Recoil Tracker momentum [MeV]. RecTrk2_pp[0] - Leading momentum track |
+| RecTrk2_track_No | Int_t | Number of reconstructed Recoil Tracker Tracks |
+| ECAL_E_total | vector<double> | Total energy deposited in the ECAL [MeV]. ECAL_E_total[0] - Truth total energy. ECAL_E_total[1] - Smeard total energy with configuration 1. |
+| ECAL_E_max | vector<double> | Maximum energy deposited of the ECAL Cell [MeV]. ECAL_E_max[0] - Truth maximum energy. ECAL_E_max[1] - Smeard maximum energy with configuration 1. |
+| HCAL_E_total | vector<double> | Total energy deposited in the HCAL [MeV]. HCAL_E_total[0] - Truth total energy. HCAL_E_total[1] - Smeard total energy with configuration 1. |
+| HCAL_E_Max_Cell | vector<double> | Maximum energy deposited of the HCAL Cell [MeV]. HCAL_E_Max_Cell[0] - Truth maximum energy. HCAL_E_Max_Cell[1] - Smeard maximum energy with configuration 1. |
+
+### Cut-based Analysis
+
+#### Examples
+
+User: Optimize cut of `ECAL_E_total[0]` with 1 track cut.
+Assistant: <code_interface type="exec" lang="python" filename="optimize_cut.py">
+
+```python
+import ROOT
+import numpy
+import matplotlib.pyplot as plt
+import argparse
+...
+
+def optimize_cut():
+    # Load files
+    ...
+
+    hist_sig = ROOT.TH1F("hist_sig", "", nbins, xmin, xmax)
+    hist_bkg = ROOT.TH1F("hist_bkg", "", nbins, xmin, xmax)
+
+    chain_sig.Draw(f"{cut_var} >> hist_sig", pre_cut)
+    chain_bkg.Draw(f"{cut_var} >> hist_bkg", pre_cut)
+
+    # Integral to a direction
+    for i in range(nbins, 0, -1):
+        cut_val =  hist_sig.GetBinLowEdge(i)
+        s = hist_sig.Integral(i, nbins)
+        b = hist_bkg.Integral(i, nbins)
+        # Calculate `S/sqrt(S+B)` for each cut_val
+        ...
+
+    # Print the cut value, cut efficiency and significance for the optimized cut
+    ...
+
+    # Plot S/sqrt(S+B) vs cut value and the maximum, with clear syle, save to png with distinctble filename
+    ...
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Optimize cut value.')
+    parser.add_argument('cut-var', nargs='?', default='ECAL_E_total[0]', help='Cut variable to optimize')
+    parser.add_argument('--pre-cut', default='...', help='Cuts applied befor current cut var')
+    parser.add_argument('--signal-dir', default='eot/signal/invisible/mAp_100/dp_ana', help='Directory containing signal ROOT files')
+    parser.add_argument('--background-dir', default='eot/background/inclusive/dp_ana', help='Directory containing background ROOT files')
+    args = parser.parse_args()
+    
+    # Optimize cut
+
+```
+
+</code_interface>
+
+#### Cut-based Analysis Steps
+
+1. Define signal region according to physics knowledge
+2. Decide an initial loose cut values for signal region
+3. Optimize cuts to maximize significance
+4. Draw and print cutflow
+5. Recursively optimize cut until the significance is maximized
+   - Vary signal region definition and cut values
+   - Optimize cuts to maximize significance
+   - Draw and print cutflow
+
+#### Guidelines
+
+- If exists multiple signal regions, signal regions should be orthogonal to each other
+- To scan S/sqrt(S+B), please use histogram integral in the loop, which is fast. DO NOT use GetEntries(cut) in a loop, which is extremly slow.
+- Plot using matplotlib, not TGraph.
+"""
+
+    def BESIII_PROMPT(self):
+        return ""
 
     def GUIDE_PROMPT(self):
         return """
