@@ -1,5 +1,5 @@
 ```
-<update_assistant_interface>
+<update_assistant_core>
 import logging
 import io, sys, os
 import json
@@ -223,14 +223,14 @@ class Assistant:
     
                 log.info(f"Starting chat round {round_count}")
 
-                choices = oai_chat_completion(
+                choices_stream = oai_chat_completion(
                     model=self.valves.BASE_MODEL,
                     url=self.valves.MODEL_API_BASE_URL,
                     api_key=self.valves.MODEL_API_KEY,
                     body=body
                 )
 
-                async for choice in choices:
+                async for choices in choices_stream:
                     # ======================================================
                     # 提前结束条件判断
                     # ======================================================
@@ -254,7 +254,7 @@ class Assistant:
                     round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
                     early_end_round = self.check_early_end_round(round_buffer.tools)
     
-                    if choice.get("finish_reason") or early_end_round:
+                    if choices.get("finish_reason") or early_end_round:
                         create_new_round = early_end_round
                         log.info("Finishing chat")
                         self.update_assistant_message(
@@ -318,7 +318,7 @@ class Assistant:
                     # 思考状态处理
                     # ======================================================
                     state_output = await self.update_thinking_state(
-                        choice.get("delta", {}), event_flags
+                        choices.get("delta", {}), event_flags
                     )
                     if state_output:
                         yield state_output  # 直接发送状态标记
@@ -334,7 +334,7 @@ class Assistant:
                     # 内容处理
                     # ======================================================
                     content = self.process_content(
-                        choice["delta"], round_buffer, event_flags
+                        choices.get("delta", {}), round_buffer, event_flags
                     )
                     if content:
                         yield content
@@ -1558,10 +1558,13 @@ class Assistant:
 
 You have access to a user's {{OP_SYSTEM}} computer workspace. You use `<code_interface>` XML tag to write codes to do analysis, calculations, or problem-solving.
 
-#### Examples
+[example begin]
 
-User: plot something
-Assistant: <code_interface type="exec" lang="python" filename="plot.py">
+EXAMPLE INPUT:
+plot something
+
+EXAMPLE OUTPUT:
+<code_interface type="exec" lang="python" filename="plot.py">
 
 ```python
 # plot and save png figure to a relative path
@@ -1569,10 +1572,11 @@ Assistant: <code_interface type="exec" lang="python" filename="plot.py">
 
 </code_interface>
 
----
+EXAMPLE INPUT:
+Create and test a simple cmake project named HelloWorld
 
-User: Create and test a simple cmake project named HelloWorld
-Assistant: <code_interface type="write" lang="cmake" filename="HelloWorld/CMakeList.txt">
+EXAMPLE OUTPUT:
+<code_interface type="write" lang="cmake" filename="HelloWorld/CMakeList.txt">
 
 ```cmake
 ...
@@ -1602,6 +1606,8 @@ make
 
 </code_interface>
 
+[example end]
+
 #### Tool Attributes
 
 - `type`: Specifies the action to perform.
@@ -1619,6 +1625,7 @@ make
 - An **extra line break** is always needed **between the `<code_interface>` XML tag and markdown code block**.
 - Use the `<code_interface>` XML node and stop right away to wait for user's action.
 - Only one code block is allowd in one `<code_interface>` XML node. DO NOT use two or more markdown code blocks together.
+- Please do not unnecessarily remove any comments or code.
 - Coding style instruction:
   - **Always aim to give meaningful outputs** (e.g., results, tables, summaries, or visuals) to better interpret and verify the findings. Avoid relying on implicit outputs; prioritize explicit and clear print statements so the results are effectively communicated to the user.
    - Run in batch mode. Save figures to png.
@@ -1908,5 +1915,5 @@ Strictly return in JSON format:
     def VISION_MODEL_PROMPT(self):
         return """Please briefly explain this figure."""
 
-</update_assistant_interface>
+</update_assistant_core>
 ```

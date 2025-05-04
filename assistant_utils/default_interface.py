@@ -221,14 +221,14 @@ class Assistant:
     
                 log.info(f"Starting chat round {round_count}")
 
-                choices = oai_chat_completion(
+                choices_stream = oai_chat_completion(
                     model=self.valves.BASE_MODEL,
                     url=self.valves.MODEL_API_BASE_URL,
                     api_key=self.valves.MODEL_API_KEY,
                     body=body
                 )
 
-                async for choice in choices:
+                async for choices in choices_stream:
                     # ======================================================
                     # 提前结束条件判断
                     # ======================================================
@@ -252,7 +252,7 @@ class Assistant:
                     round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
                     early_end_round = self.check_early_end_round(round_buffer.tools)
     
-                    if choice.get("finish_reason") or early_end_round:
+                    if choices.get("finish_reason") or early_end_round:
                         create_new_round = early_end_round
                         log.info("Finishing chat")
                         self.update_assistant_message(
@@ -316,7 +316,7 @@ class Assistant:
                     # 思考状态处理
                     # ======================================================
                     state_output = await self.update_thinking_state(
-                        choice.get("delta", {}), event_flags
+                        choices.get("delta", {}), event_flags
                     )
                     if state_output:
                         yield state_output  # 直接发送状态标记
@@ -332,7 +332,7 @@ class Assistant:
                     # 内容处理
                     # ======================================================
                     content = self.process_content(
-                        choice["delta"], round_buffer, event_flags
+                        choices.get("delta", {}), round_buffer, event_flags
                     )
                     if content:
                         yield content
@@ -1158,13 +1158,6 @@ class Assistant:
             for i, (name, prompt) in enumerate(prompt_templates.items()):
                 template_string += f"\n### {i+1}. {prompt}\n"
 
-        # Physics Guides
-        if self.valves.USE_DARKSHINE_GUIDE:
-            template_string += self.DARKSHINE_PROMPT()
-
-        if self.valves.USE_BESIII_GUIDE:
-            template_string += self.BESIII_PROMPT()
-
         # Task Prompt
         template_string += self.GUIDE_PROMPT()
 
@@ -1556,10 +1549,13 @@ class Assistant:
 
 You have access to a user's {{OP_SYSTEM}} computer workspace. You use `<code_interface>` XML tag to write codes to do analysis, calculations, or problem-solving.
 
-#### Examples
+[example begin]
 
-User: plot something
-Assistant: <code_interface type="exec" lang="python" filename="plot.py">
+EXAMPLE INPUT:
+plot something
+
+EXAMPLE OUTPUT:
+<code_interface type="exec" lang="python" filename="plot.py">
 
 ```python
 # plot and save png figure to a relative path
@@ -1567,10 +1563,11 @@ Assistant: <code_interface type="exec" lang="python" filename="plot.py">
 
 </code_interface>
 
----
+EXAMPLE INPUT:
+Create and test a simple cmake project named HelloWorld
 
-User: Create and test a simple cmake project named HelloWorld
-Assistant: <code_interface type="write" lang="cmake" filename="HelloWorld/CMakeList.txt">
+EXAMPLE OUTPUT:
+<code_interface type="write" lang="cmake" filename="HelloWorld/CMakeList.txt">
 
 ```cmake
 ...
@@ -1600,6 +1597,8 @@ make
 
 </code_interface>
 
+[example end]
+
 #### Tool Attributes
 
 - `type`: Specifies the action to perform.
@@ -1617,6 +1616,7 @@ make
 - An **extra line break** is always needed **between the `<code_interface>` XML tag and markdown code block**.
 - Use the `<code_interface>` XML node and stop right away to wait for user's action.
 - Only one code block is allowd in one `<code_interface>` XML node. DO NOT use two or more markdown code blocks together.
+- Please do not unnecessarily remove any comments or code.
 - Coding style instruction:
   - **Always aim to give meaningful outputs** (e.g., results, tables, summaries, or visuals) to better interpret and verify the findings. Avoid relying on implicit outputs; prioritize explicit and clear print statements so the results are effectively communicated to the user.
    - Run in batch mode. Save figures to png.
@@ -1648,214 +1648,6 @@ second query
 - Be concise and focused on composing high-quality search query, **avoiding unnecessary elaboration, commentary, or assumptions**.
 - **The date today is: {{CURRENT_DATE}}**. So you can search for web to get information up do date {{CURRENT_DATE}}.
 """
-
-
-    def DARKSHINE_PROMPT(self):
-        return """
-## DarkSHINE Physics Analysis Guide:
-
-### Introduction
-
-DarkSHINE Experiment is a fixed-target experiment to search for dark photons (A') produced in 8 GeV electron-on-target (EOT) collisions. The experiment is designed to detect the invisible decay of dark photons, which escape the detector with missing energy and missing momentum. The DarkSHINE detector consists of Tagging Tracker, Target, Recoil Tracker, Electromagnetic Calorimeter (ECAL), Hadronic Calorimeter (HCAL).
-
-The Target is a thin plate (~350 um) of Tungsten.
-
-Trackers (径迹探测器) are silicon microstrip detector, Tagging Tracker measure the incident beam momentum, Recoil Tracker measures the electric tracks scatter off the target. Missing momentum can be calculated by TagTrk2_pp[0] - RecTrk2_pp[0]
-
-ECAL (电磁量能器) is cubics of LYSO crystal scintillator cells, with high energy precision.
-
-HCAL (强子量能器) is a hybrid of Polystyrene cell and Iron plates, which is a sampling detector.
-
-Because of energy conservation, the total energy deposit in the ECAL and HCAL (if with calibration) will sum up to 8 GeV.
-
-Typical signature of the signal of invisible decay is a single track in the Tagging Tracker and Recoil Tracker, with missing momentum (TagTrk2_pp[0] - RecTrk2_pp[0]) and missing energy in the ECAL.
-
-Bremstruhlung events results in missing momentum, but small missing energy in the ECAL.
-
-Usually SM electron-nuclear or photon-nuclear process will create multiple tracks in the recoil tracker, thus not mis identified as signal, but still are a ratio of events passing the track number selection, and with MIP particles in the final states, becoming background. They can be veto by the HCAL with a HCAL Max Cell Energy cut (signal region defined by HCAL Max Cell energy lower than some value e.g. 1 MeV).
-
-Process with neutrino will be irreducible background, however with ignorable branching ratio.
-
-### Simulation and Reconstruction
-
-#### Examples
-
-User: For DarkSHINE, simulate and reconstruct inclusive background events
-Assistant: <code_interface type="exec" lang="bash" filename="background_inclusive_eot.sh">
-
-```bash
-#!/bin/bash
-
-# Set the original config file directory
-dsimu_script_dir="/opt/darkshine-simulation/source/DP_simu/scripts"
-default_yaml="$dsimu_script_dir/default.yaml"
-magnet_file="$dsimu_script_dir/magnet_0.75_20240521.root"
-
-echo "-- Preparing simulation config"
-sed "s:  mag_field_input\::  mag_field_input\: \"${magnet_file}\"  \#:" $default_yaml > default.yaml
-
-echo "-- Running simulation and output to dp_simu.root"
-DSimu -y default.yaml -b 100 -f dp_simu.root > simu.out 2> simu.err
-
-echo "-- Preparing reconstruction config (default input dp_simu.root and output dp_ana.root)"
-DAna -x > config.txt
-
-echo "-- Running reconstruction and output to dp_ana.root"
-DAna -c config.txt
-
-echo "All done!"
-```
-
-</code_interface>
-
-#### Simulation and Reconstruction Steps
-
-1. Configure the beam parameters and detector geometries for the simulation setup
-2. Signal simulation and reconstruction
-   1. Decide the free parameters to scan according to the signal model
-   2. Simulate signal events
-      1. Prepare config file
-      2. Run simulation program
-         - DSimu: DarkSHINE MC event generator
-         - boss.exe: BESIII MC event generator
-   3. Reconstruct the signal events.
-      1. Prepare config file
-      2. Run reconstruction program
-         - DAna: DarkSHINE reconstruction program
-         - boss.exe: BESIII reconstruction program
-3. Background simulation and reconstruction
-   1. Configure the physics process for background events
-   2. Simulate background events
-   3. Reconstruct background events
-
-### Validation
-
-#### Examples
-
-User: Compare varaibles of signal and background events
-Assistant: <code_interface type="exec" lang="python" filename="compare_kinematics.py">
-
-```python
-import ROOT
-import numpy
-import matplotlib.pyplot as plt
-import argparse
-from pathlib import Path
-...
-
-def compare(column: str, fig_name: str):
-    # create output dir if not exists
-    # load files
-    # draw histogram with pre_selection and column
-    # overlay histograms of signal and background
-    # save to png
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Compare kinematics of signal and background events.')
-    parser.add_argument('--pre-selection', default='', help='Pre-selection to apply')
-    parser.add_argument('--log-scale', action='store_true', help='Use log scale for y-axis')
-    parser.add_argument('--signal-dir', default='eot/signal/invisible/mAp_100/dp_ana', help='Directory containing signal ROOT files')
-    parser.add_argument('--background-dir', default='eot/background/inclusive/dp_ana', help='Directory containing background ROOT files')
-    parser.add_argument('--out-dir', default='plots/png', help='Output directory for plots')
-    args = parser.parse_args()
-    
-    # Loop for kinematic variables, save png with distinctable filename
-
-```
-
-</code_interface>
-
-#### Validation Guide
-
-Plot histograms to compare the signal and background kinematic distributions
-
-#### Kinematic Variables
-
-Tree Name: `dp`
-
-| Column Name | Type | Description |
-| --- | --- | --- |
-| TagTrk2_pp | Double_t[] | Reconstructed Tagging Tracker momentum [MeV]. TagTrk2_pp[0] - Leading momentum track |
-| TagTrk2_track_No | Int_t | Number of reconstructed Tagging Tracker tracks |
-| RecTrk2_pp | Double_t[] | Reconstructed Recoil Tracker momentum [MeV]. RecTrk2_pp[0] - Leading momentum track |
-| RecTrk2_track_No | Int_t | Number of reconstructed Recoil Tracker Tracks |
-| ECAL_E_total | vector<double> | Total energy deposited in the ECAL [MeV]. ECAL_E_total[0] - Truth total energy. ECAL_E_total[1] - Smeard total energy with configuration 1. |
-| ECAL_E_max | vector<double> | Maximum energy deposited of the ECAL Cell [MeV]. ECAL_E_max[0] - Truth maximum energy. ECAL_E_max[1] - Smeard maximum energy with configuration 1. |
-| HCAL_E_total | vector<double> | Total energy deposited in the HCAL [MeV]. HCAL_E_total[0] - Truth total energy. HCAL_E_total[1] - Smeard total energy with configuration 1. |
-| HCAL_E_Max_Cell | vector<double> | Maximum energy deposited of the HCAL Cell [MeV]. HCAL_E_Max_Cell[0] - Truth maximum energy. HCAL_E_Max_Cell[1] - Smeard maximum energy with configuration 1. |
-
-### Cut-based Analysis
-
-#### Examples
-
-User: Optimize cut of `ECAL_E_total[0]` with 1 track cut.
-Assistant: <code_interface type="exec" lang="python" filename="optimize_cut.py">
-
-```python
-import ROOT
-import numpy
-import matplotlib.pyplot as plt
-import argparse
-...
-
-def optimize_cut():
-    # Load files
-    ...
-
-    hist_sig = ROOT.TH1F("hist_sig", "", nbins, xmin, xmax)
-    hist_bkg = ROOT.TH1F("hist_bkg", "", nbins, xmin, xmax)
-
-    chain_sig.Draw(f"{cut_var} >> hist_sig", pre_cut)
-    chain_bkg.Draw(f"{cut_var} >> hist_bkg", pre_cut)
-
-    # Integral to a direction
-    for i in range(nbins, 0, -1):
-        cut_val =  hist_sig.GetBinLowEdge(i)
-        s = hist_sig.Integral(i, nbins)
-        b = hist_bkg.Integral(i, nbins)
-        # Calculate `S/sqrt(S+B)` for each cut_val
-        ...
-
-    # Print the cut value, cut efficiency and significance for the optimized cut
-    ...
-
-    # Plot S/sqrt(S+B) vs cut value and the maximum, with clear syle, save to png with distinctble filename
-    ...
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Optimize cut value.')
-    parser.add_argument('cut-var', nargs='?', default='ECAL_E_total[0]', help='Cut variable to optimize')
-    parser.add_argument('--pre-cut', default='...', help='Cuts applied befor current cut var')
-    parser.add_argument('--signal-dir', default='eot/signal/invisible/mAp_100/dp_ana', help='Directory containing signal ROOT files')
-    parser.add_argument('--background-dir', default='eot/background/inclusive/dp_ana', help='Directory containing background ROOT files')
-    args = parser.parse_args()
-    
-    # Optimize cut
-
-```
-
-</code_interface>
-
-#### Cut-based Analysis Steps
-
-1. Define signal region according to physics knowledge
-2. Decide an initial loose cut values for signal region
-3. Optimize cuts to maximize significance
-4. Draw and print cutflow
-5. Recursively optimize cut until the significance is maximized
-   - Vary signal region definition and cut values
-   - Optimize cuts to maximize significance
-   - Draw and print cutflow
-
-#### Guidelines
-
-- If exists multiple signal regions, signal regions should be orthogonal to each other
-- To scan S/sqrt(S+B), please use histogram integral in the loop, which is fast. DO NOT use GetEntries(cut) in a loop, which is extremly slow.
-- Plot using matplotlib, not TGraph.
-"""
-
-    def BESIII_PROMPT(self):
-        return ""
 
     def GUIDE_PROMPT(self):
         return """
