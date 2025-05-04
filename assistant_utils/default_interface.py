@@ -665,9 +665,9 @@ class Assistant:
             i += 1
 
     def is_answering(self, text):
-        if "<think>\n\n" in text and "\n</think>\n\n" in text:
+        if f"{chr(0x003C)}think{chr(0x003E)}\n\n" in text and f"\n{chr(0x003C)}/think{chr(0x003E)}\n\n" in text:
             return True
-        elif "<think>\n\n" not in text and "\n</think>\n\n" not in text:
+        elif f"{chr(0x003C)}think{chr(0x003E)}\n\n" not in text and f"\n{chr(0x003C)}/think{chr(0x003E)}\n\n" not in text:
             return True
         else:
             return False
@@ -678,14 +678,14 @@ class Assistant:
         """直接返回处理后的内容"""
         if delta.get("reasoning_content", ""):
             content = delta.get("reasoning_content", "")
-            if not "<think>\n\n" in round_buffer.total_response:
-                content = "<think>\n\n" + content
+            if not f"{chr(0x003C)}think{chr(0x003E)}\n\n" in round_buffer.total_response:
+                content = f"{chr(0x003C)}think{chr(0x003E)}\n\n" + content
             round_buffer.total_response += content
             return content
         elif delta.get("content", ""):
             content = delta.get("content", "")
             if not round_buffer.prefix_mode:
-                content = "\n</think>\n\n" + content
+                content = f"\n{chr(0x003C)}/think{chr(0x003E)}\n\n" + content
                 round_buffer.prefix_mode = True
             round_buffer.total_response += content
             return content
@@ -726,7 +726,7 @@ class Assistant:
         """更新助手消息"""
         if not prefix_reasoning:
             log.debug("Removing prefix reasoning")
-            pattern = r"<think>\n\n(.*?)\n</think>\n\n"
+            pattern = f"{chr(0x003C)}think{chr(0x003E)}\n\n(.*?)\n{chr(0x003C)}/think{chr(0x003E)}\n\n"
             round_buffer.total_response = re.sub(pattern, '', round_buffer.total_response, flags=re.DOTALL)
 
         assistante_message = {
