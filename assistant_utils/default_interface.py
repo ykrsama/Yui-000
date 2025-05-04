@@ -598,59 +598,41 @@ class Assistant:
 
     async def transfer_userproxy_role(self, messages):
         log.info("Transferring user proxy messages to user role")
+        
         i = 0
         while i < len(messages):
             msg = messages[i]
             if msg["role"] == "assistant":
                 # 删除所有running提示
-                msg["content"].replace(
+                msg["content"] = msg["content"].replace(
                     '<details type="status">\n<summary>Running...</summary>\nRunning\n</details>',
                     "",
                 )
-
-                # 用正则匹配所有<details type="user_proxy">内容
-                user_proxy_nodes = re.findall(
-                    r'<details type="user_proxy">(.*?)</details>',
-                    msg["content"],
-                    flags=re.DOTALL,
-                )
-
-                if user_proxy_nodes:
-                    user_contents = []
-                    for user_proxy_node in user_proxy_nodes:
-                        user_proxy_text = str(user_proxy_node)
-                        summary_node = re.search(
-                            r"<summary>(.*?)</summary>",
-                            user_proxy_text,
-                            flags=re.DOTALL,
-                        )
-                        if summary_node:
-                            summary_text = summary_node.group(1).strip()
-                        else:
-                            summary_text = ""
-                        user_proxy_text = re.sub(
-                            r"<summary>.*?</summary>",
-                            "",
-                            user_proxy_text,
-                            flags=re.DOTALL,
-                        ).strip()
-                        user_contents.append(f"{summary_text}\n\n{user_proxy_text}")
-                    merged_user_contents = "\n\n".join(user_contents)
-
-                    # (1) 删除消息中的<user_proxy>标签（保留其他内容）
-                    clean_content = re.sub(
-                        r'<details type="user_proxy">.*?</details>',
-                        "",
-                        msg["content"],
-                        flags=re.DOTALL,
-                    ).strip()
-
-                    msg["content"] = clean_content
-
-                    new_user_msg = {"role": "user", "content": merged_user_contents}
-                    messages.insert(i + 1, new_user_msg)  # 在当前消息后插入
-                    i += 1
-
+                # Split the content into segments
+                segments = re.split(r'(<details type="user_proxy">.*?</details>)', msg["content"], flags=re.DOTALL)
+                
+                new_segments = []
+                for segment in segments:
+                    user_proxy_match = re.match(r'<details type="user_proxy">(.*?)</details>', segment, flags=re.DOTALL)
+                    
+                    if user_proxy_match:
+                        # Extract content for the user_proxy section
+                        user_proxy_text = user_proxy_match.group(1).strip()
+                        if user_proxy_text.startswith("<summary>"):
+                            # Remove the <summary> tag
+                            user_proxy_text = user_proxy_text.replace("<summary>", "")
+                            user_proxy_text = user_proxy_text.replace("</summary>", "")
+                        # Add as a user role message
+                        new_segments.append({"role": "user", "content": user_proxy_text})
+                    else:
+                        # Add non-user_proxy content as assistant message
+                        if segment.strip():  # Avoid adding empty segments
+                            new_segments.append({"role": "assistant", "content": segment.strip()})
+    
+                # Insert the processed segments into the messages list
+                messages[i:i+1] = new_segments
+                i += len(new_segments) - 1  # Adjust the index to continue correctly
+    
             i += 1
 
     async def merge_adjacent_roles(self, messages):
