@@ -229,7 +229,7 @@ class Assistant:
                 # 更新系统提示词
                 self.set_system_prompt(messages, prompt_templates, session_buffer)
     
-                log.info(f"Starting chat round {round_count}")
+                log.info(f"Starting chat round {round_count+1}")
 
                 choices_stream = oai_chat_completion(
                     model=self.valves.BASE_MODEL,
@@ -378,7 +378,7 @@ class Assistant:
                         )
     
                     log.debug(messages[1:])
-                    log.debug(f"Current round: {round_count}, create_new_round: {create_new_round}")
+                    log.debug(f"Current round: {round_count+1}, create_new_round: {create_new_round}")
 
                     # Reset varaiables
                     round_buffer.reset()
