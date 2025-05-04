@@ -165,7 +165,6 @@ class EventFlags:
     Event flags class
     """
     def __init__(self):
-        self.thinking_state: int = 0
         self.mem_updated = False
 
 
@@ -191,7 +190,7 @@ class RoundBuffer:
         self.window_embeddings: List = []
         self.paragraph_begin_id: int = 0
         self.total_response = ""
-        self.reasoning_content = ""
+        self.prefix_mode = False
         self.tools = []
 
     def reset(self):
@@ -200,7 +199,7 @@ class RoundBuffer:
         self.window_embeddings = []
         self.paragraph_begin_id = 0
         self.total_response = ""
-        self.reasoning_content = ""
+        self.prefix_mode = False
         self.tools = []
 
 
@@ -260,6 +259,7 @@ class Assistant:
             # 获取请求参数
             payload = {**body, "model": self.valves.BASE_MODEL}
             messages = payload["messages"]
+            log.debug(f"Body: {body}")
     
             # ==================================================================
             # 预处理消息（规范化、解析图片）
@@ -331,6 +331,7 @@ class Assistant:
     
                         # 判断是否打断当前生成并进入下一轮
                         if self.check_refresh_round(session_buffer, event_flags):
+                            round_buffer.prefix_mode = True
                             break
     
                         # ======================================================
@@ -419,27 +420,17 @@ class Assistant:
                             log.debug(messages[1:])
                             log.debug(f"Current round: {round_count}, create_new_round: {create_new_round}, finish_reason: {choice.get('finish_reason')}, early_end_round: {early_end_round}")
                             break
-                        # ======================================================
-                        # 思考状态处理
-                        # ======================================================
-                        state_output = await self.update_thinking_state(
-                            choice.get("delta", {}), event_flags
-                        )
-                        if state_output:
-                            yield state_output  # 直接发送状态标记
-    
+   
                         do_semantic_segmentation = False
                         if self.valves.REALTIME_RAG:
                             do_semantic_segmentation = True
-                        if self.valves.REALTIME_IO and self.is_answering(
-                            event_flags.thinking_state
-                        ):
+                        if self.valves.REALTIME_IO and self.is_answering(round_buffer.total_response):
                             do_semantic_segmentation = True
                         # ======================================================
                         # 内容处理
                         # ======================================================
                         content = self.process_content(
-                            choice["delta"], round_buffer, event_flags
+                            choice.get("delta", {}), round_buffer, event_flags
                         )
                         if content:
                             yield content
@@ -752,74 +743,31 @@ class Assistant:
                 messages.pop(i + 1)
             i += 1
 
-    def is_thinking(self, thinking_state):
-        return thinking_state in [1, 2]
-
-    def is_answering(self, thinking_state):
-        return thinking_state == 0
-
-    async def update_thinking_state(self, delta: dict, event_flags: EventFlags) -> str:
-        """
-        更新思考状态
-        0: 未开始 / 回答中
-        1: resasoning_content
-        2: content为思考，process content时放入reasoning_content，并等待f"{chr(0x003C)}/think{chr(0x003E)}"
-        3: f"{chr(0x003C)}/think{chr(0x003E)}"
-        4: '\n\n'
-        ---
-        rc 0 -> 1  f"{chr(0x003C)}think{chr(0x003E)}"\n\n
-        rc 1
-        content 1 -> 0 \nf"{chr(0x003C)}/think{chr(0x003E)}"\n\n
-        ---
-        rc 0 -> 1
-        content ... 2
-        content 'f"{chr(0x003C)}/think{chr(0x003E)}"' 2 -> 3
-        content '\n\n' 3-> 4
-        content ... 4 -> 0
-        ---
-        """
-        state_output = ""
-
-        # 状态转换：未开始 -> 思考中
-        if event_flags.thinking_state == 0 and delta.get("reasoning_content"):
-            # 0 -> 1
-            event_flags.thinking_state = 1
-            state_output = f"{chr(0x003C)}think{chr(0x003E)}\n\n"
-        elif event_flags.thinking_state == 1 and delta.get("content"):
-            # 1 -> 0
-            event_flags.thinking_state = 0
-            state_output = f"\n{chr(0x003C)}/think{chr(0x003E)}\n\n"
-        elif event_flags.thinking_state == 2 and delta.get("content") == f"{chr(0x003C)}/think{chr(0x003E)}":
-            # 2 -> 3
-            event_flags.thinking_state = 3
-            state_output = f"\n{chr(0x003C)}/think{chr(0x003E)}\n\n"
-        elif event_flags.thinking_state == 3 and delta.get("content") == "\n\n":
-            # 3 -> 4
-            event_flags.thinking_state = 4
-        elif event_flags.thinking_state == 4 and delta.get("content"):
-            # 4 -> 0
-            event_flags.thinking_state = 0
-
-        return state_output
+    def is_answering(self, text):
+        if "<think>\n\n" in text and "\n</think>\n\n" in text:
+            return True
+        elif "<think>\n\n" not in text and "\n</think>\n\n" not in text:
+            return True
+        else:
+            return False
 
     def process_content(
         self, delta: dict, round_buffer: RoundBuffer, event_flags: EventFlags
     ) -> str:
         """直接返回处理后的内容"""
         if delta.get("reasoning_content", ""):
-            reasoning_content = delta.get("reasoning_content", "")
-            round_buffer.reasoning_content += reasoning_content
-            return reasoning_content
+            content = delta.get("reasoning_content", "")
+            if not "<think>\n\n" in round_buffer.total_response:
+                content = "<think>\n\n" + content
+            round_buffer.total_response += content
+            return content
         elif delta.get("content", ""):
-            delta = delta.get("content", "")
-            if event_flags.thinking_state == 0:
-                # 回答状态时才放入回答
-                round_buffer.total_response += delta
-                return delta
-            elif event_flags.thinking_state == 2:
-                # 思考状态时放入思考内容
-                round_buffer.reasoning_content += delta
-                return delta
+            content = delta.get("content", "")
+            if not round_buffer.prefix_mode:
+                content = "\n</think>\n\n" + content
+                round_buffer.prefix_mode = True
+            round_buffer.total_response += content
+            return content
         return ""
 
     async def update_sentence_buffer(self, text, round_buffer: RoundBuffer) -> int:
@@ -855,30 +803,20 @@ class Assistant:
         prefix_reasoning: bool = False,
     ):
         """更新助手消息"""
-        if prefix_reasoning and round_buffer.reasoning_content:
-            if round_buffer.total_response:
-                assistante_message = {
-                    "role": "assistant",
-                    "content": f"{chr(0x003C)}think{chr(0x003E)}\n\n{round_buffer.reasoning_content}\n{chr(0x003C)}/think{chr(0x003E)}\n\n{round_buffer.total_response}",
-                    "prefix": True,
-                }
-            else:
-                assistante_message = {
-                    "role": "assistant",
-                    "content": f"{chr(0x003C)}think{chr(0x003E)}\n\n{round_buffer.reasoning_content}",
-                    "prefix": True,
-                }
-                event_flags.thinking_state = 2
-        else:
-            if not round_buffer.total_response:
-                log.error("No total_response, cannot update assistant message?")
-                return
+        total_response = round_buffer.total_response
+        if not prefix_reasoning:
+            pattern = r"<think>\n\n(.*?)\n</think>\n\n"
+            match = re.search(pattern, round_buffer.total_response, re.DOTALL)
+            if match:
+                total_response = re.sub(
+                    pattern, "", round_buffer.total_response, count=1
+                )
 
-            assistante_message = {
-                "role": "assistant",
-                "content": round_buffer.total_response,
-                "prefix": True,
-            }
+        assistante_message = {
+            "role": "assistant",
+            "content": total_response,
+            "prefix": True,
+        }
 
         if messages[-1]["role"] == "assistant":
             messages[-1] = assistante_message
@@ -2012,7 +1950,7 @@ if __name__ == "__main__":
         return """
 ## Task:
 
-- You are a independent, patient, careful and accurate assistant, utilizing tools to help user. You analysis the chat history, decide and determine wether to use tool, or simply response to user. You can call tools by using xml node. Available Tools: Code Interface, Web Search, or Knowledge Search.
+- You are a independent, patient, careful and accurate assistant, utilizing tools to help user. You analysis the chat history, decide and determine wether to use tool, or simply response to user. You can call tools by using xml node. Available Tools: Code Interface and Web Search.
 
 ## Guidelines:
 
