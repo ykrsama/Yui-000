@@ -13,17 +13,6 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-@dataclass
-class VectorDBResultObject:
-    """
-    Vector DB search result object
-    """
-    id_: str
-    distance: float
-    document: str
-    metadata: Dict
-    query_embedding: List
-
 class ManagedThread(threading.Thread):
     """
     Managed thread class for automatic removal from manager when thread ends
@@ -200,7 +189,7 @@ async def oai_chat_completion(model: str,
                     error = await response.aread()
                     error_str = error.decode(errors="ignore")
                     err_msg = json.loads(error_str).get("message", error_str)[:200]
-                    yield {"error": f"{status_code}: {err_msg}"}
+                    yield {"error": f"{response.status_code}: {err_msg}"}
                     return
 
                 # 流式处理响应

@@ -35,67 +35,14 @@ from open_webui.models.files import Files, FileForm
 from hepai import HRModel
 import numpy as np
 
-
-class ManagedThread(threading.Thread):
-    """
-    Managed thread class for automatic removal from manager when thread ends
-    """
-
-    def __init__(self, manager, target, args, kwargs):
-        super().__init__(target=target, args=args, kwargs=kwargs)
-        self.manager = manager  # 持有管理器实例的引用
-
-    def run(self):
-        try:
-            super().run()  # 执行目标函数
-        except Exception as e:
-            log.error(f"Thread error: {e}")
-        finally:
-            self.manager.remove_thread(self)  # 确保无论是否异常都执行移除操作
-
-
-class ThreadManager:
-    """
-    Thread manager class
-    """
-
-    def __init__(self):
-        self.threads = []  # 存储活跃线程的容器
-        self.lock = threading.Lock()  # 保证线程安全的锁
-
-    def submit(self, target, args=(), kwargs=None):
-        """提交新线程到线程池"""
-        if kwargs is None:
-            kwargs = {}
-
-        # 创建托管线程实例
-        thread = ManagedThread(self, target, args, kwargs)
-
-        # 使用锁保证线程安全地添加线程
-        with self.lock:
-            self.threads.append(thread)
-
-        thread.start()  # 注意：先添加后启动保证移除操作有效性
-
-    def remove_thread(self, thread):
-        """从容器中移除已完成的线程"""
-        with self.lock:
-            if thread in self.threads:
-                self.threads.remove(thread)
-
-    def join_all(self):
-        """等待所有线程执行完成"""
-        # 复制当前线程列表避免遍历时修改
-        with self.lock:
-            current_threads = list(self.threads)
-
-        for thread in current_threads:
-            thread.join()  # 等待每个线程完成
-
-    def active_count(self):
-        """获取当前活跃线程数量"""
-        with self.lock:
-            return len(self.threads)
+sys.path.append("/Users/xuliang/third_party")
+from assistant_utils.tools import (
+        ManagedThread,
+        ThreadManager,
+        oai_chat_completion,
+        extract_json,
+        strip_triple_backtick,
+)
 
 
 @dataclass
@@ -205,10 +152,10 @@ class RoundBuffer:
 
 class Assistant:
     def __init__(self, valves):
+        self.model_id = "Yui-000"
         self.valves = valves
         self.data_prefix = "data: "
         self.rag_thread_max = 1
-        self.model_id = "Yui-000"
 
     async def interface(
         self, body: dict, __event_emitter__: Callable[[dict], Awaitable[None]] = None
@@ -217,11 +164,7 @@ class Assistant:
         if not self.valves.MODEL_API_KEY:
             yield json.dumps({"error": "未配置API密钥"}, ensure_ascii=False)
             return
-        # 准备请求参数
-        headers = {
-            "Authorization": f"Bearer {self.valves.MODEL_API_KEY}",
-            "Content-Type": "application/json",
-        }
+
         try:
             # ==================================================================
             # 初始化变量
@@ -235,12 +178,6 @@ class Assistant:
             event_flags: EventFlags = EventFlags()
             session_buffer: SessionBuffer = SessionBuffer(chat_id)
             round_buffer: RoundBuffer = RoundBuffer()
-    
-            # Initialize client
-            client = httpx.AsyncClient(
-                http2=True,
-                timeout=None,
-            )
     
             # Initialize tools
             TOOL = {}
@@ -256,14 +193,10 @@ class Assistant:
                 TOOL["web_search"] = self.web_search
                 prompt_templates["web_search"] = self.DEFAULT_WEB_SEARCH_PROMPT()
     
-            # 获取请求参数
-            payload = {**body, "model": self.valves.BASE_MODEL}
-            messages = payload["messages"]
-    
             # ==================================================================
             # 预处理消息（规范化、解析图片）
             # ==================================================================
-            # TODO
+            messages = body["messages"]
             await self.process_message_figures(messages, __event_emitter__)
             # User proxy转移到User 角色以保护身份认同
             await self.transfer_userproxy_role(messages)
@@ -280,7 +213,7 @@ class Assistant:
                     session_buffer.memory.add_object(result)
     
             log.debug("Old message:")
-            log.debug(messages)
+            log.debug(messages[1:])
     
             # ==================================================================
             # 发起API请求
@@ -288,7 +221,6 @@ class Assistant:
             create_new_round = True
             round_count = 0
             while create_new_round and round_count < self.valves.MAX_LOOP:
-    
                 # RAG队列大于阈值时等待，再继续下一轮
                 if session_buffer.rag_thread_mgr.active_count() > self.rag_thread_max:
                     await asyncio.sleep(0.1)
@@ -297,114 +229,139 @@ class Assistant:
                 # 更新系统提示词
                 self.set_system_prompt(messages, prompt_templates, session_buffer)
     
-                log.debug(messages[1:])
-                log.info("Starting chat round")
+                log.info(f"Starting chat round {round_count}")
+
+                choices_stream = oai_chat_completion(
+                    model=self.valves.BASE_MODEL,
+                    url=self.valves.MODEL_API_BASE_URL,
+                    api_key=self.valves.MODEL_API_KEY,
+                    body=body
+                )
+
+                async for choices in choices_stream:
+                    if "error" in choices:
+                        yield json.dumps({"error": choices["error"]}, ensure_ascii=False)
+                        create_new_round = False
+                        break
+                    # ======================================================
+                    # 提前结束条件判断
+                    # ======================================================
+                    # 检查rag结果队列
+                    while not session_buffer.rag_result_queue.empty():
+                        result = session_buffer.rag_result_queue.get()
+                        for result_object in result:
+                            session_buffer.memory.add_object(result_object)
+                        event_flags.mem_updated = True
     
-                async with client.stream(
-                    "POST",
-                    f"{self.valves.MODEL_API_BASE_URL}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                    timeout=None,
-                ) as response:
-                    # 错误处理
-                    if response.status_code != 200:
-                        error = await response.aread()
-                        yield self._format_error(response.status_code, error)
-                        return
+                    # 判断是否打断当前生成并进入下一轮
+                    if self.check_refresh_round(session_buffer, event_flags):
+                        log.debug("Breaking chat round")
+                        create_new_round = True
+                        round_buffer.prefix_mode = True
+                        break
+   
+                    # ======================================================
+                    # 结束条件判断
+                    # ======================================================
+                    # 更新工具调用情况
+                    round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
+                    early_end_round = self.check_early_end_round(round_buffer.tools)
     
-                    # 流式处理响应
-                    async for line in response.aiter_lines():
-                        if not line.startswith(self.data_prefix):
-                            continue
-                        # ======================================================
-                        # 提前结束条件判断
-                        # ======================================================
-                        # 检查rag结果队列
-                        while not session_buffer.rag_result_queue.empty():
-                            result = session_buffer.rag_result_queue.get()
-                            for result_object in result:
-                                session_buffer.memory.add_object(result_object)
-                            # TODO 更新工作记忆
-                            event_flags.mem_updated = True
-    
-                        # 判断是否打断当前生成并进入下一轮
-                        if self.check_refresh_round(session_buffer, event_flags):
-                            log.debug("Breaking chat round")
-                            create_new_round = True
-                            round_buffer.prefix_mode = True
-                            break
-    
-                        # ======================================================
-                        # 解析数据
-                        # ======================================================
-                        json_str = line[len(self.data_prefix) :]
-    
-                        # 去除首尾空格后检查是否为结束标记
-                        if json_str.strip() == "[DONE]":
-                            return
-    
-                        try:
-                            data = json.loads(json_str)
-                        except json.JSONDecodeError as e:
-                            error_detail = f"解析失败 - 内容：{json_str}，原因：{e}"
-                            yield self._format_error("JSONDecodeError", error_detail)
-                            return
-    
-                        choice = data.get("choices", [{}])[0]
-    
-                        # ======================================================
-                        # 结束条件判断
-                        # ======================================================
-                        # 更新工具调用情况
-                        round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
-                        early_end_round = self.check_early_end_round(round_buffer.tools)
-    
-                        if choice.get("finish_reason") or early_end_round:
-                            create_new_round = early_end_round
-                            log.info("Finishing chat")
-                            self.update_assistant_message(
-                                messages,
-                                round_buffer,
-                                event_flags,
-                                prefix_reasoning=False,
-                            )
-                            paragraph = await self.finalize_sentences(
-                                session_buffer, round_buffer
-                            )
-                            # =================================================
-                            # Call tools
-                            # =================================================
-                            if round_buffer.tools:
-                                yield f'\n\n<details type="status">\n<summary>Running...</summary>\nRunning\n</details>\n'
-                                user_proxy_reply = ""
-                                for i, tool in enumerate(round_buffer.tools):
-                                    if i > 0:
-                                        await asyncio.sleep(0.1)
-                                    summary, content = await TOOL[tool["name"]](
-                                        session_buffer, tool["attributes"], tool["content"]
-                                    )
-    
-                                    # Check for image urls
-                                    image_urls = self.extract_image_urls(content)
-    
-                                    if image_urls:
-                                        figure_summary = await self.query_vision_model(
-                                            self.VISION_MODEL_PROMPT(), image_urls, __event_emitter__
-                                        )
-                                        content += figure_summary
-                                    
-                                    user_proxy_reply += f"{summary}\n\n{content}\n\n"
-                                    yield f'\n<details type="user_proxy">\n<summary>{summary}</summary>\n{content}\n</details>\n'
-                                # Update user proxy message
-                                messages.append(
-                                    {
-                                        "role": "user",
-                                        "content": user_proxy_reply,
-                                    }
+                    if choices.get("finish_reason") or early_end_round:
+                        create_new_round = early_end_round
+                        log.info("Finishing chat")
+                        self.update_assistant_message(
+                            messages,
+                            round_buffer,
+                            event_flags,
+                            prefix_reasoning=False,
+                        )
+                        paragraph = await self.finalize_sentences(
+                            session_buffer, round_buffer
+                        )
+                        # =================================================
+                        # Call tools
+                        # =================================================
+                        if round_buffer.tools:
+                            yield f'\n\n<details type="status">\n<summary>Running...</summary>\nRunning\n</details>\n'
+                            user_proxy_reply = ""
+                            for i, tool in enumerate(round_buffer.tools):
+                                if i > 0:
+                                    await asyncio.sleep(0.1)
+                                summary, content = await TOOL[tool["name"]](
+                                    session_buffer, tool["attributes"], tool["content"]
                                 )
     
-                            if paragraph:
+                                # Check for image urls
+                                image_urls = self.extract_image_urls(content)
+    
+                                if image_urls:
+                                    figure_summary = await self.query_vision_model(
+                                        self.VISION_MODEL_PROMPT(), image_urls, __event_emitter__
+                                    )
+                                    content += figure_summary
+                                
+                                user_proxy_reply += f"{summary}\n\n{content}\n\n"
+                                yield f'\n<details type="user_proxy">\n<summary>{summary}</summary>\n{content}\n</details>\n'
+                            # Update user proxy message
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": user_proxy_reply,
+                                }
+                            )
+    
+                        if paragraph:
+                            session_buffer.rag_thread_mgr.submit(
+                                self.query_collection_to_queue,
+                                args=(
+                                    session_buffer.rag_result_queue,
+                                    [paragraph],
+                                    collection_name_ids,
+                                    __event_emitter__
+                                ),
+                            )
+    
+                        # Reset varaiables
+                        round_buffer.reset()
+                        log.debug(f"Current round: {round_count}, create_new_round: {create_new_round}")
+                        round_count += 1
+                        break
+   
+                    do_semantic_segmentation = False
+                    if self.valves.REALTIME_RAG:
+                        do_semantic_segmentation = True
+                    if self.valves.REALTIME_IO and self.is_answering(round_buffer.total_response):
+                        do_semantic_segmentation = True
+                    # ======================================================
+                    # 内容处理
+                    # ======================================================
+                    content = self.process_content(
+                        choices.get("delta", {}), round_buffer, event_flags
+                    )
+                    if content:
+                        yield content
+                        self.update_assistant_message(
+                            messages,
+                            round_buffer,
+                            event_flags,
+                            prefix_reasoning=True,
+                        )
+    
+                        if do_semantic_segmentation:
+                            # 根据语义分割段落
+                            sentence_n = await self.update_sentence_buffer(
+                                content, round_buffer
+                            )
+                            if sentence_n == 0:
+                                continue
+                            new_paragraphs = await self.semantic_segmentation(
+                                sentence_n, round_buffer
+                            )
+                            if len(new_paragraphs) == 0:
+                                continue
+                            # 实时RAG搜索
+                            for paragraph in new_paragraphs:
                                 session_buffer.rag_thread_mgr.submit(
                                     self.query_collection_to_queue,
                                     args=(
@@ -414,60 +371,12 @@ class Assistant:
                                         __event_emitter__
                                     ),
                                 )
-    
-                            # Reset varaiables
-                            round_buffer.reset()
-                            round_count += 1
-                            log.debug(messages[1:])
-                            log.debug(f"Current round: {round_count}, create_new_round: {create_new_round}, finish_reason: {choice.get('finish_reason')}, early_end_round: {early_end_round}")
-                            break
-   
-                        do_semantic_segmentation = False
-                        if self.valves.REALTIME_RAG:
-                            do_semantic_segmentation = True
-                        if self.valves.REALTIME_IO and self.is_answering(round_buffer.total_response):
-                            do_semantic_segmentation = True
-                        # ======================================================
-                        # 内容处理
-                        # ======================================================
-                        content = self.process_content(
-                            choice.get("delta", {}), round_buffer, event_flags
-                        )
-                        if content:
-                            yield content
-                            self.update_assistant_message(
-                                messages,
-                                round_buffer,
-                                event_flags,
-                                prefix_reasoning=True,
-                            )
-    
-                            if do_semantic_segmentation:
-                                # 根据语义分割段落
-                                sentence_n = await self.update_sentence_buffer(
-                                    content, round_buffer
-                                )
-                                if sentence_n == 0:
-                                    continue
-                                new_paragraphs = await self.semantic_segmentation(
-                                    sentence_n, round_buffer
-                                )
-                                if len(new_paragraphs) == 0:
-                                    continue
-                                # 实时RAG搜索
-                                for paragraph in new_paragraphs:
-                                    session_buffer.rag_thread_mgr.submit(
-                                        self.query_collection_to_queue,
-                                        args=(
-                                            session_buffer.rag_result_queue,
-                                            [paragraph],
-                                            collection_name_ids,
-                                            __event_emitter__
-                                        ),
-                                    )
 
-                        create_new_round = False
-    
+                create_new_round = False
+                log.debug(messages[1:])
+
+            log.info("Chat finished succesfully.")
+
         except Exception as e:
             log.error(f"Error in assistant interface: {e}")
             yield json.dumps({"error": str(e)}, ensure_ascii=False)
@@ -1062,26 +971,6 @@ class Assistant:
                     continue
                 all_results.extend(results)
 
-                #if event_emitter:
-                #    for obj in results:
-                #        content = obj.document
-                #        title = obj.metadata.get("source", "Unknown").replace("~", "/")
-                #        await event_emitter(
-                #            {
-                #                "type": "citation",
-                #                "data": {
-                #                    "document": [content],
-                #                    "metadata": [
-                #                        {
-                #                            "date_accessed": datetime.now().isoformat(),
-                #                            "source": title,
-                #                        }
-                #                    ],
-                #                    "source": {"name": title},
-                #                },
-                #            }
-                #        )
-
             log.debug(f"Search done with {len(all_results)} results")
 
             return all_results
@@ -1125,29 +1014,6 @@ class Assistant:
         except Exception as e:
             log.error(f"Error querying collection to queue: {e}")
 
-    def extract_json(self, content):
-        # 匹配 ```json 块中的 JSON
-        json_block_pattern = r"```json\s*({.*?})\s*```"
-        # 匹配 ``` 块中的 JSON
-        block_pattern = r"```\s*({.*?})\s*```"
-        #log.debug(f"Content: {content}")
-        try:
-            # 尝试匹配 ```json 块
-            match = re.search(json_block_pattern, content, re.DOTALL)
-            if match:
-                return json.loads(match.group(1))
-
-            # 尝试匹配 ``` 块
-            match = re.search(block_pattern, content, re.DOTALL)
-            if match:
-                return json.loads(match.group(1))
-
-            # 尝试直接转换
-            return json.loads(content)
-        except Exception as e:
-            log.error(f"Failed to extract JSON: {e}")
-
-        return None
 
     async def generate_query_keywords(self, contexts: List, collection_name_ids):
         """
@@ -1189,7 +1055,7 @@ class Assistant:
             response.raise_for_status()
             data = response.json()
             content = data.get("choices", [{}])[0]["message"]["content"]
-            result_json = self.extract_json(content)
+            result_json = extract_json(content)
             collection_names = result_json.get("collection_names", [])
             keywords = result_json.get("queries", [])
         except Exception as e:
@@ -1300,16 +1166,7 @@ class Assistant:
         code_type = attributes.get("type", "")
         lang = attributes.get("lang", "")
         filename = attributes.get("filename", "")
-
-        # Remove the first line and the last line (markdown code block)
-        lines = content.strip().splitlines()
-        if len(lines) <= 2:
-            return (
-                "Error: Too few lines to extract code",
-                "Check if you have code in markdown code block",
-            )
-        lines = lines[1:-1]
-        content = "\n".join(lines)
+        content = strip_triple_backtick(content)
 
         if code_type == "exec":
             # Execute the code
@@ -1497,7 +1354,6 @@ class Assistant:
         key: str = "",
     ) -> str:
         try:
-            log.debug(f"Connecting Vision Model")
             payload = {
                 "model": model,
                 "messages": [
@@ -1619,7 +1475,7 @@ class Assistant:
                 self.generate_vl_response(
                     prompt=prompt,
                     image_url=url,
-                    model=self.valves.VISION_MODEL,
+                    model="ark/doubao-vision-pro",
                     url=self.valves.MODEL_API_BASE_URL,
                     key=self.valves.MODEL_API_KEY,
                 )
@@ -1649,10 +1505,13 @@ class Assistant:
 
 You have access to a user's {{OP_SYSTEM}} computer workspace. You use `<code_interface>` XML tag to write codes to do analysis, calculations, or problem-solving.
 
-#### Examples
+[example begin]
 
-User: plot something
-Assistant: <code_interface type="exec" lang="python" filename="plot.py">
+EXAMPLE INPUT:
+plot something
+
+EXAMPLE OUTPUT:
+<code_interface type="exec" lang="python" filename="plot.py">
 
 ```python
 # plot and save png figure to a relative path
@@ -1660,10 +1519,11 @@ Assistant: <code_interface type="exec" lang="python" filename="plot.py">
 
 </code_interface>
 
----
+EXAMPLE INPUT:
+Create and test a simple cmake project named HelloWorld
 
-User: Create and test a simple cmake project named HelloWorld
-Assistant: <code_interface type="write" lang="cmake" filename="HelloWorld/CMakeList.txt">
+EXAMPLE OUTPUT:
+<code_interface type="write" lang="cmake" filename="HelloWorld/CMakeList.txt">
 
 ```cmake
 ...
@@ -1693,6 +1553,8 @@ make
 
 </code_interface>
 
+[example end]
+
 #### Tool Attributes
 
 - `type`: Specifies the action to perform.
@@ -1710,6 +1572,7 @@ make
 - An **extra line break** is always needed **between the `<code_interface>` XML tag and markdown code block**.
 - Use the `<code_interface>` XML node and stop right away to wait for user's action.
 - Only one code block is allowd in one `<code_interface>` XML node. DO NOT use two or more markdown code blocks together.
+- Please do not unnecessarily remove any comments or code.
 - Coding style instruction:
   - **Always aim to give meaningful outputs** (e.g., results, tables, summaries, or visuals) to better interpret and verify the findings. Avoid relying on implicit outputs; prioritize explicit and clear print statements so the results are effectively communicated to the user.
    - Run in batch mode. Save figures to png.
@@ -1742,7 +1605,6 @@ second query
 - **The date today is: {{CURRENT_DATE}}**. So you can search for web to get information up do date {{CURRENT_DATE}}.
 """
 
-
     def DARKSHINE_PROMPT(self):
         return """
 ## DarkSHINE Physics Analysis Guide:
@@ -1771,10 +1633,11 @@ Process with neutrino will be irreducible background, however with ignorable bra
 
 ### Simulation and Reconstruction
 
-#### Examples
+EXAMPLE INPUT:
+For DarkSHINE, simulate and reconstruct inclusive background events
 
-User: For DarkSHINE, simulate and reconstruct inclusive background events
-Assistant: <code_interface type="exec" lang="bash" filename="background_inclusive_eot.sh">
+EXAMPLE OUTPUT:
+<code_interface type="exec" lang="bash" filename="background_inclusive_eot.sh">
 
 ```bash
 #!/bin/bash
@@ -1823,10 +1686,11 @@ echo "All done!"
 
 ### Validation
 
-#### Examples
+EXAMPLE INPUT:
+Compare varaibles of signal and background events
 
-User: Compare varaibles of signal and background events
-Assistant: <code_interface type="exec" lang="python" filename="compare_kinematics.py">
+EXAMPLE OUTPUT:
+<code_interface type="exec" lang="python" filename="compare_kinematics.py">
 
 ```python
 import ROOT
@@ -1851,7 +1715,7 @@ if __name__ == "__main__":
     parser.add_argument('--background-dir', default='eot/background/inclusive/dp_ana', help='Directory containing background ROOT files')
     parser.add_argument('--out-dir', default='plots/png', help='Output directory for plots')
     args = parser.parse_args()
-    
+
     # Loop for kinematic variables, save png with distinctable filename
 
 ```
@@ -1879,10 +1743,11 @@ Tree Name: `dp`
 
 ### Cut-based Analysis
 
-#### Examples
+EXAMPLE INPUT:
+Optimize cut of `ECAL_E_total[0]` with 1 track cut.
 
-User: Optimize cut of `ECAL_E_total[0]` with 1 track cut.
-Assistant: <code_interface type="exec" lang="python" filename="optimize_cut.py">
+EXAMPLE OUTPUT:
+<code_interface type="exec" lang="python" filename="optimize_cut.py">
 
 ```python
 import ROOT
@@ -1922,7 +1787,7 @@ if __name__ == "__main__":
     parser.add_argument('--signal-dir', default='eot/signal/invisible/mAp_100/dp_ana', help='Directory containing signal ROOT files')
     parser.add_argument('--background-dir', default='eot/background/inclusive/dp_ana', help='Directory containing background ROOT files')
     args = parser.parse_args()
-    
+
     # Optimize cut
 
 ```
