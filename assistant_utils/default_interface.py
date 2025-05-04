@@ -323,14 +323,20 @@ class Assistant:
 
                 if finishing_chat:
                     log.info("Finishing chat")
-                    create_new_round = early_end_round
                     round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
+                    # close think tag if not closed
+                    if round_buffer.total_response.startswith(f"{chr(0x003C)}think{chr(0x003E)}"):
+                        if f"\n{chr(0x003C)}/think{chr(0x003E)}\n\n" not in round_buffer.total_response:
+                            round_buffer.total_response += f"\n{chr(0x003C)}/think{chr(0x003E)}\n\n"
+                            yield f"\n{chr(0x003C)}/think{chr(0x003E)}\n\n"
+
                     self.update_assistant_message(
                         messages,
                         round_buffer,
                         event_flags,
                         prefix_reasoning=False,
                     )
+
                     paragraph = await self.finalize_sentences(
                         session_buffer, round_buffer
                     )
@@ -338,6 +344,7 @@ class Assistant:
                     # Call tools
                     # =================================================
                     if round_buffer.tools:
+                        create_new_round = True
                         yield f'\n\n<details type="status">\n<summary>Running...</summary>\nRunning\n</details>\n'
                         user_proxy_reply = ""
                         for i, tool in enumerate(round_buffer.tools):
@@ -377,7 +384,6 @@ class Assistant:
                             ),
                         )
     
-                    log.debug(messages[1:])
                     log.debug(f"Current round: {round_count+1}, create_new_round: {create_new_round}")
 
                     # Reset varaiables
