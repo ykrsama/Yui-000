@@ -138,11 +138,23 @@ class Pipe:
                         if c.get("type", "") == "text":
                             content_text = c.get("text", "")
                             break
+                core = self.find_assistant_core(content_text)
+                if core:
+                    if not assistant_code_block:
+                        log.info("Found last assistant code block")
+                        assistant_code_block = core["content"]
 
-                code_blocks = re.findall(r'<update_assistant_core>(.*?)</update_assistant_core>', content_text, re.DOTALL)
-                if code_blocks:
-                    assistant_code_block = self.strip_triple_backtick(code_blocks[-1])
-                    break
+                    if core["attributes"].get("hidden") == "true":
+                        log.info("Removing hidden code block from meesage")
+                        pattern = r"<(overwrite_assistant_core)(\s+[^>]*)?>(.*?)</\1>"
+                        if isinstance(content, List):
+                            for c in messages[i]["content"]:
+                                if c.get("type", "") == "text":
+                                    c["text"] = re.sub(pattern, '', c.get("text", ""), flags=re.DOTALL)
+                                    break
+                        else:
+                            messages[i]["content"] = re.sub(pattern, '', messages[i]["content"], flags=re.DOTALL)
+
             if not assistant_code_block:
                 log.warning("Fallback to load from default_interface.py")
                 default_interface_path = os.path.expanduser("~/third_party/assistant_utils/default_interface.py")
@@ -209,4 +221,42 @@ class Pipe:
                 lines = lines[1:-1]
             text = "\n".join(lines)
         return text
+
+    def find_assistant_core(self, content):
+        log.info("Finding assistant core...")
+        # Define the regex pattern to match the XML tags
+        pattern = re.compile(
+            r"<(overwrite_assistant_core)(\s+[^>]*)?>(.*?)</\1>",
+            re.DOTALL | re.MULTILINE,
+        )
+
+        # Find all matches in the content
+        matches = pattern.findall(content)
+
+        # If no matches found, return None
+        if not matches:
+            return None
+
+        for match in matches:
+            log.info(f"Match found: {len(matches)}")
+            # Extract the tag name, attributes, and content
+            tag_name = match[0]
+            attributes_str = match[1]
+            tag_content = match[2].strip()
+
+            # Extract attributes into a dictionary
+            attributes = {}
+            for attr in attributes_str.split():
+                if "=" in attr:
+                    key, value = attr.split("=", 1)
+                    value = value.strip("\"'")
+                    attributes[key] = value
+            
+            return {
+                "name": tag_name,
+                "attributes": attributes,
+                "content": tag_content,
+            }
+        
+        return None
 
