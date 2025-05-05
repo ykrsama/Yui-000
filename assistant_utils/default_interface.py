@@ -123,6 +123,7 @@ class SessionBuffer:
         self.rag_thread_mgr: ThreadManager = ThreadManager()
         self.rag_result_queue: Queue = Queue()
         self.memory: WorkingMemory = WorkingMemory(chat_id)
+        self.chat_id = chat_id
         self.chat_history: str = ""
         self.code_worker = None
         self.code_worker_op_system = "Linux"
@@ -612,6 +613,7 @@ class Assistant:
                 # 删除所有running提示
                 msg["content"] = msg["content"].replace(
                     '<details type="status">\n<summary>Running...</summary>\nRunning\n</details>',
+
                     "",
                 )
                 # Split the content into segments
@@ -666,16 +668,18 @@ class Assistant:
         self, delta: dict, round_buffer: RoundBuffer, event_flags: EventFlags
     ) -> str:
         """直接返回处理后的内容"""
+        think_open = f"{chr(0x003C)}think{chr(0x003E)}\n\n"
+        think_close = f"\n{chr(0x003C)}/think{chr(0x003E)}\n\n"
         if delta.get("reasoning_content", ""):
             content = delta.get("reasoning_content", "")
-            if not f"{chr(0x003C)}think{chr(0x003E)}\n\n" in round_buffer.total_response:
-                content = f"{chr(0x003C)}think{chr(0x003E)}\n\n" + content
+            if not think_open in round_buffer.total_response:
+                content = think_open + content
             round_buffer.total_response += content
             return content
         elif delta.get("content", ""):
             content = delta.get("content", "")
             if not round_buffer.prefix_mode:
-                content = f"\n{chr(0x003C)}/think{chr(0x003E)}\n\n" + content
+                content = think_close + content
                 round_buffer.prefix_mode = True
             round_buffer.total_response += content
             return content
@@ -1033,7 +1037,7 @@ class Assistant:
         }
         query_prompt = template.render(**replace)
         task_messages = [{"role": "user", "content": query_prompt}]
-        headers = {"Authorization": f"Bearer {self.valves.MODEL_API_KEY}"}
+        headers = {"Authorization": f"Bearer {self.valves.TASK_MODEL_API_KEY}"}
         payload = {
             "model": self.valves.TASK_MODEL,
             "messages": task_messages,
@@ -1042,7 +1046,7 @@ class Assistant:
         keywords = []
         try:
             response = requests.post(
-                f"{self.valves.MODEL_API_BASE_URL}/chat/completions",
+                f"{self.valves.TASK_MODEL_API_BASE_URL}/chat/completions",
                 headers=headers,
                 json=payload,
                 stream=False,
@@ -1157,6 +1161,7 @@ class Assistant:
         if session_buffer.code_worker is None:
             session_buffer.code_worker, session_buffer.code_worker_op_system = self.init_code_worker()
 
+        session_buffer.code_worker.set_work_dir(f"run-{session_buffer.chat_id}")
         # Extract the code interface type and language
         code_type = attributes.get("type", "")
         lang = attributes.get("lang", "")
@@ -1471,8 +1476,8 @@ class Assistant:
                     prompt=prompt,
                     image_url=url,
                     model=self.valves.VISION_MODEL,
-                    url=self.valves.MODEL_API_BASE_URL,
-                    key=self.valves.MODEL_API_KEY,
+                    url=self.valves.TASK_MODEL_API_BASE_URL,
+                    key=self.valves.TASK_MODEL_API_KEY,
                 )
                 for url in batch_urls
             ]
