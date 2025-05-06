@@ -33,6 +33,13 @@ class Pipe:
         MODEL_API_KEY: str = Field(
             default="api key here", description="用于身份验证的API密钥"
         )
+        TASK_MODEL_API_BASE_URL: str = Field(
+            default="https://aiapi001.ihep.ac.cn/apiv2",
+            description="语言模型API的基础请求地址",
+        )
+        TASK_MODEL_API_KEY: str = Field(
+            default="api key here", description="用于身份验证的API密钥"
+        )
         BASE_MODEL: str = Field(
             default="deepseek-ai/deepseek-r1:671b",
             description="对话的模型名称",

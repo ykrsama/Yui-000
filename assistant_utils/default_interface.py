@@ -678,7 +678,7 @@ class Assistant:
             return content
         elif delta.get("content", ""):
             content = delta.get("content", "")
-            if not round_buffer.prefix_mode:
+            if (not round_buffer.prefix_mode) and (not think_close in round_buffer.total_response):
                 content = think_close + content
                 round_buffer.prefix_mode = True
             round_buffer.total_response += content
