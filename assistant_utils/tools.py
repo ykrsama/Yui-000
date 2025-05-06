@@ -1,7 +1,7 @@
 # utils/tools.py
 import logging
 import json
-import os
+import os, sys
 from typing import AsyncGenerator, Callable, Awaitable, Optional, Dict, List, Tuple
 from dataclasses import dataclass, asdict
 import re
@@ -10,8 +10,31 @@ import asyncio
 import threading
 from queue import Queue
 import httpx
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from prompt import (
+    DEFAULT_CODE_INTERFACE_PROMPT,
+    DEFAULT_WEB_SEARCH_PROMPT,
+    DARKSHINE_PROMPT,
+    BESIII_PROMPT,
+    GUIDE_PROMPT,
+    DEFAULT_QUERY_GENERATION_PROMPT,
+    VISION_MODEL_PROMPT,
+)
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class VectorDBResultObject:
+    """
+    Vector DB search result object
+    """
+    id_: str
+    distance: float
+    document: str
+    metadata: Dict
+    query_embedding: List
+
 
 class ManagedThread(threading.Thread):
     """
@@ -233,4 +256,192 @@ def strip_triple_backtick(text: str) -> str:
             lines = lines[1:-1]
         text = "\n".join(lines)
     return text
+ 
+
+async def search_chroma_db(
+    collection_id, embeddings: List, top_k: int, max_distance: float
+):
+    """
+    Search Chroma DB
+    """
+    result_objects = []
+    try:
+        if not collection_id in VECTOR_DB_CLIENT.client.list_collections():
+            log.warning(
+                f"Collection {collection_id} not found in Vector DB, maybe this is an empty collection."
+            )
+            return result_objects
+
+        results = VECTOR_DB_CLIENT.search(
+            collection_name=collection_id,
+            vectors=embeddings,
+            limit=top_k,
+        )
+
+        if not results:
+            return result_objects
+
+        for query_i in range(len(embeddings)):
+            for k in range(len(results.ids[query_i])):
+                if (max_distance > 0) and (
+                    results.distances[query_i][k] > max_distance
+                ):
+                    continue
+                result_objects.append(
+                    VectorDBResultObject(
+                        id_=results.ids[query_i][k],
+                        distance=results.distances[query_i][k],
+                        document=results.documents[query_i][k],
+                        metadata=results.metadatas[query_i][k],
+                        query_embedding=embeddings[query_i],
+                    )
+                )
+
+    except Exception as e:
+        log.error(f"Error searching vector db: {e}")
+
+    return result_objects
+
+async def generate_query_keywords(contexts: List, collection_name_ids, model, base_url, api_key):
+    """
+    Generate query keywords using llm
+    """
+    query_template = DEFAULT_QUERY_GENERATION_PROMPT()
+
+    # Create a Jinja2 Template object
+    template = Template(query_template)
+    current_date = datetime.now()
+    formatted_date = current_date.strftime("%Y-%m-%d")
+
+    # Render the template with a list of items
+    replace = {
+        "CONTEXTS": contexts,
+        "COLLECTION_NAMES": list(collection_name_ids.keys())
+    }
+    query_prompt = template.render(**replace)
+    task_messages = [{"role": "user", "content": query_prompt}]
+    headers = {"Authorization": f"Bearer {api_key}"}
+    payload = {
+        "model": model,
+        "messages": task_messages,
+    }
+    collection_names = []
+    keywords = []
+    try:
+        response = requests.post(
+            f"{base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            stream=False,
+        )
+        response.raise_for_status()
+        data = response.json()
+        content = data.get("choices", [{}])[0]["message"]["content"]
+        result_json = extract_json(content)
+        collection_names = result_json.get("collection_names", [])
+        keywords = result_json.get("queries", [])
+    except Exception as e:
+        log.error(f"Failed to generate query keywords: {e}")
+    log.debug(f"Generated query keywords: {keywords}")
+    return collection_names, keywords
+
+def clean_text(text):
+    # 去除emoji，避免embedding报错
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"  # emoticons
+        "\U0001F300-\U0001F5FF"  # symbols & pictographs
+        "\U0001F680-\U0001F6FF"  # transport & map symbols
+        "\U0001F1E0-\U0001F1FF"  # flags (iOS)
+        "]+",
+        flags=re.UNICODE,
+    )
+    return emoji_pattern.sub(r"", text)  # no emoji
+
+async def get_embeddings(texts: List[str], model, base_url, api_key) -> List[List[float]]:
+    """调用API获取文本嵌入"""
+    embeddings = []
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        response = requests.post(
+            f"{base_url}/embeddings",
+            headers=headers,
+            json={
+                "model": model,
+                "input": [clean_text(text) for text in texts],
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        for item in data["data"]:
+            if not "embedding" in item:
+                continue
+            embeddings.append(item["embedding"])
+    except Exception as e:
+        log.error(f"Failed to get embedding for texts: {texts}\nError: {e}")
+    return embeddings
+
+async def generate_vl_response(
+    prompt: str,
+    image_url: str,
+    model: str,
+    url: str,
+    key: str,
+) -> str:
+    try:
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_url, "detail": "high"},
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt,
+                        },
+                    ],
+                }
+            ],
+            "stream": False,
+            "max_tokens": 512,
+            "stop": None,
+            "temperature": 0.1,
+            "top_p": 0.5,
+            "top_k": 30,
+            "frequency_penalty": 1.1,
+            "n": 1,
+            "response_format": {"type": "text"},
+        }
+
+        response = requests.request(
+           "POST",
+           url=f"{url}/chat/completions",
+           json=payload,
+           headers={
+               "Authorization": f"Bearer {key}",
+               "Content-Type": "application/json"
+           },
+        )
+
+        # Check for valid response
+        response.raise_for_status()
+
+        # Parse and return embeddings if available
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+
+    except httpx.HTTPStatusError as e:
+        log.error(
+            f"HTTP error occurred: {e.response.status_code} - {e.response.text}"
+        )
+        return f"HTTP error occurred: {e.response.status_code} - {e.response.text}"
+    except httpx.ReadTimeout as e:
+        log.error(f"Read Timeout error occurred")
+        return f"Read Timeout error occurred"
+
+    return ""
 
