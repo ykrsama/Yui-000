@@ -199,7 +199,7 @@ class Pipe:
                 yield result
 
         except Exception as e:
-            yield self._format_error("Exception", str(e))
+            yield self._format_error("Yui-Framework-Error", str(e))
         
     def _format_error(self, status_code: int, error: bytes) -> str:
         # 如果 error 已经是字符串，则无需 decode
@@ -249,7 +249,7 @@ class Pipe:
             # Extract the tag name, attributes, and content
             tag_name = match[0]
             attributes_str = match[1]
-            tag_content = match[2].strip()
+            tag_content = self.strip_triple_backtick(match[2])
 
             # Extract attributes into a dictionary
             attributes = {}

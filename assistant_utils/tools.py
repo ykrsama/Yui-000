@@ -1,15 +1,18 @@
-# utils/tools.py
 import logging
+import io, sys, os
 import json
-import os, sys
-from typing import AsyncGenerator, Callable, Awaitable, Optional, Dict, List, Tuple
-from dataclasses import dataclass, asdict
+import httpx
 import re
-import numpy as np
+import requests
+from typing import AsyncGenerator, Callable, Awaitable, Optional, Dict, List, Tuple
+from pydantic import BaseModel, Field
 import asyncio
 import threading
 from queue import Queue
-import httpx
+from jinja2 import Template
+from datetime import datetime
+from dataclasses import dataclass
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from prompt import (
     DEFAULT_CODE_INTERFACE_PROMPT,
@@ -445,3 +448,87 @@ async def generate_vl_response(
 
     return ""
 
+def extract_image_urls(text: str) -> list:
+    """
+    Extract image URLs from text with 2 criteria:
+    1. URLs ending with .png/.jpeg/.jpg/.gif/.svg (case insensitive)
+    2. URLs in markdown image format regardless of extension
+
+    Args:
+        text: Input text containing potential image URLs
+
+    Returns:
+        List of unique image URLs sorted by first occurrence
+    """
+    # Match URLs with image extensions (including query parameters)
+    ext_pattern = re.compile(
+        r"https?:\/\/[^\s]+?\.(?:png|jpe?g|gif|svg)(?:\?[^\s]*)?(?=\s|$)",
+        re.IGNORECASE,
+    )
+
+    # Match markdown image syntax URLs
+    md_pattern = re.compile(r"!\[[^\]]*\]\((https?:\/\/[^\s\)]+)")
+
+    # Find all matches while preserving order
+    seen = set()
+    result = []
+
+    for match in ext_pattern.findall(text) + md_pattern.findall(text):
+        if match not in seen:
+            seen.add(match)
+            result.append(match)
+
+    return result
+
+async def transfer_userproxy_role(messages):
+    log.info("Transferring user proxy messages to user role")
+
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg["role"] == "assistant":
+            # 删除所有running提示
+            msg["content"] = msg["content"].replace(
+                '<details type="status">\n<summary>Running...</summary>\nRunning\n</details>',
+
+                "",
+            )
+            # Split the content into segments
+            segments = re.split(r'(<details type="user_proxy">.*?</details>)', msg["content"], flags=re.DOTALL)
+
+            new_segments = []
+            for segment in segments:
+                user_proxy_match = re.match(r'<details type="user_proxy">(.*?)</details>', segment, flags=re.DOTALL)
+
+                if user_proxy_match:
+                    # Extract content for the user_proxy section
+                    user_proxy_text = user_proxy_match.group(1).strip()
+                    if user_proxy_text.startswith("<summary>"):
+                        # Remove the <summary> tag
+                        user_proxy_text = user_proxy_text.replace("<summary>", "")
+                        user_proxy_text = user_proxy_text.replace("</summary>", "")
+                    # Add as a user role message
+                    new_segments.append({"role": "user", "content": user_proxy_text})
+                else:
+                    # Add non-user_proxy content as assistant message
+                    if segment.strip():  # Avoid adding empty segments
+                        new_segments.append({"role": "assistant", "content": segment.strip()})
+
+            # Insert the processed segments into the messages list
+            messages[i:i + 1] = new_segments
+            i += len(new_segments) - 1
+
+        i += 1
+
+async def merge_adjacent_roles(messages):
+    log.info("Merging adjacent messages with the same role")
+    i = 0
+    while i < len(messages) - 1:
+        if messages[i]["role"] == messages[i + 1]["role"]:
+            # 合并相同角色的消息
+            combined_content = (
+                    messages[i]["content"] + "\n" + messages[i + 1]["content"]
+            )
+            messages[i]["content"] = combined_content
+            messages.pop(i + 1)
+        i += 1

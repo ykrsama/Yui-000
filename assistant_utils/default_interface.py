@@ -47,6 +47,9 @@ from assistant_utils.tools import (
     generate_query_keywords,
     get_embeddings,
     generate_vl_response,
+    extract_image_urls,
+    transfer_userproxy_role,
+    merge_adjacent_roles,
 )
 from assistant_utils.prompt import (
     DEFAULT_CODE_INTERFACE_PROMPT,
@@ -162,26 +165,13 @@ class Assistant:
     async def interface(
         self, body: dict, __event_emitter__: Callable[[dict], Awaitable[None]] = None
     ) -> AsyncGenerator[str, None]:
-        # 验证配置
-        if not self.valves.MODEL_API_KEY:
-            yield json.dumps({"error": "未配置API密钥"}, ensure_ascii=False)
-            return
-
         try:
-            # ==================================================================
-            # 初始化变量
-            # ==================================================================
-            # 获取chat id, user id, message id
+            # Initialize
             user_id, chat_id, message_id = self.extract_event_info(__event_emitter__)
-    
-            # 初始化知识库
             collection_name_ids = await self.init_knowledge(user_id, chat_id)
-    
             event_flags: EventFlags = EventFlags()
             session_buffer: SessionBuffer = SessionBuffer(chat_id)
             round_buffer: RoundBuffer = RoundBuffer()
-    
-            # Initialize tools
             TOOL = {}
             prompt_templates = {}
     
@@ -195,18 +185,14 @@ class Assistant:
                 TOOL["web_search"] = self.web_search
                 prompt_templates["web_search"] = DEFAULT_WEB_SEARCH_PROMPT()
     
-            # ==================================================================
-            # 预处理消息（规范化、解析图片）
-            # ==================================================================
+            # Pre-process message (format and figures)
             messages = body["messages"]
             await self.process_message_figures(messages, __event_emitter__)
-            # User proxy转移到User 角色以保护身份认同
-            await self.transfer_userproxy_role(messages)
-            # 处理消息以防止相同的角色
-            await self.merge_adjacent_roles(messages)
-            # 更新系统提示词
+            await transfer_userproxy_role(messages)
+            await merge_adjacent_roles(messages)
             self.set_system_prompt(messages, prompt_templates, session_buffer)
-            # RAG用户消息
+
+            # RAG
             if messages[-1]["role"] == "user":
                 results = await self.query_collection(
                     messages[-1]["content"], collection_name_ids, __event_emitter__
@@ -217,18 +203,15 @@ class Assistant:
             log.debug("Old message:")
             log.debug(messages)
     
-            # ==================================================================
-            # 发起API请求
-            # ==================================================================
             create_new_round = True
             round_count = 0
             while create_new_round and round_count < self.valves.MAX_LOOP:
-                # RAG队列大于阈值时等待，再继续下一轮
+                # Wait if RAG thread longer than threshold
                 if session_buffer.rag_thread_mgr.active_count() > self.rag_thread_max:
                     await asyncio.sleep(0.1)
                     continue
     
-                # 更新系统提示词
+                # Update system prompt again
                 self.set_system_prompt(messages, prompt_templates, session_buffer)
     
                 log.info(f"Starting chat round {round_count+1}")
@@ -249,17 +232,15 @@ class Assistant:
                         create_new_round = False
                         finishing_chat = False
                         break
-                    # ======================================================
-                    # 提前结束条件判断
-                    # ======================================================
-                    # 检查rag结果队列
+
+                    # Check rag queue
                     while not session_buffer.rag_result_queue.empty():
                         result = session_buffer.rag_result_queue.get()
                         for result_object in result:
                             session_buffer.memory.add_object(result_object)
                         event_flags.mem_updated = True
     
-                    # 判断是否打断当前生成并进入下一轮
+                    # Check if break current chat round in the middle of generation
                     if self.check_refresh_round(session_buffer, event_flags):
                         log.debug("Breaking chat round")
                         create_new_round = True
@@ -267,13 +248,11 @@ class Assistant:
                         round_buffer.prefix_mode = True
                         break
    
-                    # ======================================================
-                    # 结束条件判断
-                    # ======================================================
-                    # 更新工具调用情况
+                    # Check tool usage
                     round_buffer.tools = self.find_tool_usage(round_buffer.total_response)
                     early_end_round = self.check_early_end_round(round_buffer.tools)
-    
+
+                    # Finish reason condition
                     if choices.get("finish_reason") or early_end_round:
                         finishing_chat = True
                         break
@@ -283,9 +262,8 @@ class Assistant:
                         do_semantic_segmentation = True
                     if self.valves.REALTIME_IO and self.is_answering(round_buffer.total_response):
                         do_semantic_segmentation = True
-                    # ======================================================
-                    # 内容处理
-                    # ======================================================
+
+                    # Process content
                     content = self.process_content(
                         choices.get("delta", {}), round_buffer, event_flags
                     )
@@ -299,7 +277,6 @@ class Assistant:
                         )
     
                         if do_semantic_segmentation:
-                            # 根据语义分割段落
                             sentence_n = await self.update_sentence_buffer(
                                 content, round_buffer
                             )
@@ -310,7 +287,7 @@ class Assistant:
                             )
                             if len(new_paragraphs) == 0:
                                 continue
-                            # 实时RAG搜索
+                            # RAG
                             for paragraph in new_paragraphs:
                                 session_buffer.rag_thread_mgr.submit(
                                     self.query_collection_to_queue,
@@ -342,9 +319,8 @@ class Assistant:
                     paragraph = await self.finalize_sentences(
                         session_buffer, round_buffer
                     )
-                    # =================================================
+
                     # Call tools
-                    # =================================================
                     if round_buffer.tools:
                         create_new_round = True
                         yield f'\n\n<details type="status">\n<summary>Running...</summary>\nRunning\n</details>\n'
@@ -357,7 +333,7 @@ class Assistant:
                             )
     
                             # Check for image urls
-                            image_urls = self.extract_image_urls(content)
+                            image_urls = extract_image_urls(content)
     
                             if image_urls:
                                 figure_summary = await self.query_vision_model(
@@ -388,7 +364,7 @@ class Assistant:
     
                     log.debug(f"Current round: {round_count+1}, create_new_round: {create_new_round}")
 
-                    # Reset varaiables
+                    # Reset variables
                     round_buffer.reset()
                     round_count += 1
 
@@ -474,9 +450,6 @@ class Assistant:
     def extract_event_info(
         self, event_emitter: Callable[[dict], Awaitable[None]]
     ) -> Tuple[str, str, str]:
-        """
-        从事件发射器中提取用户ID、聊天ID和消息ID。
-        """
         if not event_emitter or not event_emitter.__closure__:
             return None, None, None
         for cell in event_emitter.__closure__:
@@ -488,9 +461,7 @@ class Assistant:
 
     async def init_knowledge(self, user_id: str, chat_id: str) -> Dict:
         """
-        初始化知识库数据，将其存储在 collection_name_ids 字典中。
-        :param user_id: 用户ID
-        :return: 知识库字典和消息记录文件名称
+        Initialize knowledge base and store in collection_name_ids dict
         """
         log.debug("Initializing knowledge bases")
         collection_name_ids: Dict[str, str] = {}  # 初始化知识库字典
@@ -500,12 +471,10 @@ class Assistant:
             long_chat_knowledge = None
             knowledge_bases = Knowledges.get_knowledge_bases_by_user_id(
                 user_id, "read"
-            )  # 获取知识库
-            # 获取知识库名称列表
+            )
             rag_collection_names = [
                 name.strip() for name in self.valves.RAG_COLLECTION_NAMES.split(",")
             ]
-            # 遍历知识库列表
             for knowledge in knowledge_bases:
                 knowledge_name = knowledge.name  # 获取知识库名称
                 if knowledge_name in rag_collection_names:
@@ -542,13 +511,12 @@ class Assistant:
         return collection_name_ids
 
     async def process_message_figures(self, messages, event_emitter: Callable[[dict], Awaitable[None]]):
-            # 检查最后一条user消息是否包含图片
             log.debug("Checking last user message for images")
             if messages[-1]["role"] == "user":
                 content = messages[-1]["content"]
                 if isinstance(content, List):
                     text_content = ""
-                    # 查找文字内容
+                    # Find text
                     for c in content:
                         if c.get("type", "") == "text":
                             text_content = c.get("text", "")
@@ -557,7 +525,7 @@ class Assistant:
                             )
                             break
 
-                    # 查找图片内容
+                    # Find image
                     for c in content:
                         if c.get("type", "") == "image_url":
                             log.debug("Found image in last user message")
@@ -573,10 +541,10 @@ class Assistant:
                                 )
                                 # insert to message content
                                 text_content += vision_summary
-                    # 替换消息
+                    # Replace
                     messages[-1]["content"] = text_content
                 else:
-                    image_urls = self.extract_image_urls(content)
+                    image_urls = extract_image_urls(content)
                     if image_urls:
                         log.debug(f"Found image in last user message: {image_urls}")
                         # Call Vision Language Model
@@ -585,7 +553,7 @@ class Assistant:
                         )
                         messages[-1]["content"] += vision_summary
 
-            # 确保user message是text-only
+            # Make user message text-only
             log.debug("Checking all user messages content format")
             for msg in messages:
                 if msg["role"] == "user":
@@ -593,69 +561,16 @@ class Assistant:
                     if isinstance(content, List):
                         log.debug("Found a list of content in user message")
                         text_content = ""
-                        # 查找文字内容
+                        # Find text content
                         for c in content:
                             if c.get("type", "") == "text":
                                 text_content = c.get("content", "")
                                 log.debug(f"Found text in user message: {text_content}")
                                 break
 
-                        # 替换消息
+                        # Replace message
                         log.debug("Replacing user message content")
                         msg["content"] = text_content
-
-    async def transfer_userproxy_role(self, messages):
-        log.info("Transferring user proxy messages to user role")
-        
-        i = 0
-        while i < len(messages):
-            msg = messages[i]
-            if msg["role"] == "assistant":
-                # 删除所有running提示
-                msg["content"] = msg["content"].replace(
-                    '<details type="status">\n<summary>Running...</summary>\nRunning\n</details>',
-
-                    "",
-                )
-                # Split the content into segments
-                segments = re.split(r'(<details type="user_proxy">.*?</details>)', msg["content"], flags=re.DOTALL)
-                
-                new_segments = []
-                for segment in segments:
-                    user_proxy_match = re.match(r'<details type="user_proxy">(.*?)</details>', segment, flags=re.DOTALL)
-                    
-                    if user_proxy_match:
-                        # Extract content for the user_proxy section
-                        user_proxy_text = user_proxy_match.group(1).strip()
-                        if user_proxy_text.startswith("<summary>"):
-                            # Remove the <summary> tag
-                            user_proxy_text = user_proxy_text.replace("<summary>", "")
-                            user_proxy_text = user_proxy_text.replace("</summary>", "")
-                        # Add as a user role message
-                        new_segments.append({"role": "user", "content": user_proxy_text})
-                    else:
-                        # Add non-user_proxy content as assistant message
-                        if segment.strip():  # Avoid adding empty segments
-                            new_segments.append({"role": "assistant", "content": segment.strip()})
-    
-                # Insert the processed segments into the messages list
-                messages[i:i+1] = new_segments
-                i += len(new_segments) - 1
-    
-            i += 1
-
-    async def merge_adjacent_roles(self, messages):
-        log.info("Merging adjacent messages with the same role")
-        i = 0
-        while i < len(messages) - 1:
-            if messages[i]["role"] == messages[i + 1]["role"]:
-                # 合并相同角色的消息
-                combined_content = (
-                    messages[i]["content"] + "\n" + messages[i + 1]["content"]
-                )
-                messages[i]["content"] = combined_content
-                messages.pop(i + 1)
-            i += 1
 
     def is_answering(self, text):
         if f"{chr(0x003C)}think{chr(0x003E)}\n\n" in text and f"\n{chr(0x003C)}/think{chr(0x003E)}\n\n" in text:
@@ -718,7 +633,6 @@ class Assistant:
         event_flags: EventFlags,
         prefix_reasoning: bool = True,
     ):
-        """更新助手消息"""
         if not prefix_reasoning:
             log.debug("Removing prefix reasoning")
             pattern = f"{chr(0x003C)}think{chr(0x003E)}\n\n(.*?)\n{chr(0x003C)}/think{chr(0x003E)}\n\n"
@@ -1217,38 +1131,6 @@ class Assistant:
     # Vision Language Model
     # =========================================================================
 
-    def extract_image_urls(self, text: str) -> list:
-        """
-        Extract image URLs from text with 2 criteria:
-        1. URLs ending with .png/.jpeg/.jpg/.gif/.svg (case insensitive)
-        2. URLs in markdown image format regardless of extension
-
-        Args:
-            text: Input text containing potential image URLs
-
-        Returns:
-            List of unique image URLs sorted by first occurrence
-        """
-        # Match URLs with image extensions (including query parameters)
-        ext_pattern = re.compile(
-            r"https?:\/\/[^\s]+?\.(?:png|jpe?g|gif|svg)(?:\?[^\s]*)?(?=\s|$)",
-            re.IGNORECASE,
-        )
-
-        # Match markdown image syntax URLs
-        md_pattern = re.compile(r"!\[[^\]]*\]\((https?:\/\/[^\s\)]+)")
-
-        # Find all matches while preserving order
-        seen = set()
-        result = []
-
-        for match in ext_pattern.findall(text) + md_pattern.findall(text):
-            if match not in seen:
-                seen.add(match)
-                result.append(match)
-
-        return result
-
     async def query_vision_model(
         self,
         prompt: str,
@@ -1298,4 +1180,3 @@ class Assistant:
             f"**Figure {idx}:** {res}" 
             for idx, res in enumerate(results, 1)
         )
-
