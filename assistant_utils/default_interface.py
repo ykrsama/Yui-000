@@ -1,6 +1,8 @@
 import logging
 import io, sys, os
 import json
+import uuid
+
 import httpx
 import re
 import requests
@@ -168,6 +170,8 @@ class Assistant:
         try:
             # Initialize
             user_id, chat_id, message_id = self.extract_event_info(__event_emitter__)
+            if not chat_id:
+                chat_id = str(uuid.uuid4())
             collection_name_ids = await self.init_knowledge(user_id, chat_id)
             event_flags: EventFlags = EventFlags()
             session_buffer: SessionBuffer = SessionBuffer(chat_id)
@@ -951,7 +955,7 @@ class Assistant:
         lang = attributes.get("lang", "")
         filename = attributes.get("filename", "")
         content = strip_triple_backtick(content)
-        work_dir=f"run-{session_buffer.chat_id}"
+        work_dir=f"run-{session_buffer.chat_id[:8]}"
 
         if code_type == "exec":
             # Execute the code
