@@ -1273,7 +1273,7 @@ class Assistant:
         for i in range(0, len(image_urls), BATCH_SIZE):
             batch_urls = image_urls[i:i+BATCH_SIZE]
             tasks = [
-                self.generate_vl_response(
+                generate_vl_response(
                     prompt=prompt,
                     image_url=url,
                     model=self.valves.VISION_MODEL,
