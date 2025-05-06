@@ -1035,8 +1035,9 @@ class Assistant:
         # Extract the code interface type and language
         code_type = attributes.get("type", "")
         lang = attributes.get("lang", "")
-        filename = os.path.join("run-{session_buffer.chat_id}", attributes.get("filename", ""))
+        filename = attributes.get("filename", "")
         content = strip_triple_backtick(content)
+        work_dir=f"run-{session_buffer.chat_id}"
 
         if code_type == "exec":
             # Execute the code
@@ -1044,6 +1045,7 @@ class Assistant:
                 try:
                     result = session_buffer.code_worker.write_code(
                         file_path=filename,
+                        work_dir=work_dir,
                         content=content,
                         execute=True,
                         lang=lang,
@@ -1054,7 +1056,7 @@ class Assistant:
                     return f"Error executing {filename}", f"{str(e)}"
             elif lang == "bash":
                 try:
-                    result = session_buffer.code_worker.run_command(command=content, timeout=300)
+                    result = session_buffer.code_worker.run_command(command=content, work_dir=work_dir, timeout=300)
                     return "Command executed", result
                 except Exception as e:
                     return "Error executing bash command", f"{str(e)}"
@@ -1073,7 +1075,7 @@ class Assistant:
             # Write the code to a file
             try:
                 result = session_buffer.code_worker.write_code(
-                    file_path=filename, content=content
+                    file_path=filename, work_dir=work_dir, content=content
                 )
                 return f"Written file: {filename}", result
             except Exception as e:
@@ -1098,7 +1100,7 @@ class Assistant:
                 updated = match.group("updated")
                 try:
                     result = session_buffer.code_worker.search_replace(
-                        file_path=filename, original=original, updated=updated
+                        file_path=filename, original=original, updated=updated, work_dir=work_dir
                     )
                     return f"Updated {filename}", result
                 except Exception as e:
