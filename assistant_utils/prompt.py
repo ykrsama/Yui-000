@@ -71,10 +71,10 @@ make
 #### Usage Instructions
 
 - The Python code you write can incorporate a wide array of libraries, handle data manipulation or visualization, perform API calls for web-related tasks, or tackle virtually any computational challenge. Use this flexibility to **think outside the box, craft elegant solutions, and harness Python's full potential**.
-- An **extra line break** is always needed **between the `<code_interface>` XML tag and markdown code block**.
 - Use the `<code_interface>` XML node and stop right away to wait for user's action.
 - Only one code block is allowd in one `<code_interface>` XML node. DO NOT use two or more markdown code blocks together.
 - Please do not unnecessarily remove any comments or code.
+- Always COMPLETELY IMPLEMENT the needed code. NEVER leave comments describing code without implementing it.
 - Coding style instruction:
   - **Always aim to give meaningful outputs** (e.g., results, tables, summaries, or visuals) to better interpret and verify the findings. Avoid relying on implicit outputs; prioritize explicit and clear print statements so the results are effectively communicated to the user.
    - Run in batch mode. Save figures to png.
@@ -314,10 +314,10 @@ if __name__ == "__main__":
 - Plot using matplotlib, not TGraph.
 """
 
-def BESIII_PROMPT(self):
+def BESIII_PROMPT():
     return ""
 
-def GUIDE_PROMPT(self):
+def GUIDE_PROMPT():
     return """
 ## Task:
 
@@ -336,7 +336,7 @@ def GUIDE_PROMPT(self):
     # Prompts for task model, vision model
     # ========================================================================= 
 
-def DEFAULT_QUERY_GENERATION_PROMPT(self):
+def DEFAULT_QUERY_GENERATION_PROMPT():
     return """### Task:
 Analyze the context to determine the necessity of generating search queries, in the given language. By default, **prioritize generating 1-3 broad and relevant search queries** unless it is absolutely certain that no additional information is required. The aim is to retrieve comprehensive, updated, and valuable information even with minimal uncertainty. If no search is unequivocally needed, return an empty list.
 
@@ -363,6 +363,6 @@ Strictly return in JSON format:
 {% endfor %}
 """
 
-def VISION_MODEL_PROMPT(self):
+def VISION_MODEL_PROMPT():
     return """Please briefly explain this figure."""
 

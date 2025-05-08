@@ -171,7 +171,21 @@ class Pipe:
                 else:
                     yield "\nError: Default interface file not found"
                     return
-    
+
+            # Add this after extracting assistant_code_block but before executing it
+            if assistant_code_block:
+                # Apply any edit blocks if they exist
+                for i in range(len(messages)):
+                    content = messages[i]["content"]
+                    content_text = content
+                    if isinstance(content, List):
+                        for c in content:
+                            if c.get("type", "") == "text":
+                                content_text = c.get("text", "")
+                                break
+                    # Apply edit blocks to the assistant code
+                    assistant_code_block = self.find_editblock_assistant_core(content_text, assistant_code_block)
+
             log.info("Evaluating assistant code block")
             namespace = globals().copy()
             # Execute the extracted code within the local_vars context
@@ -267,3 +281,61 @@ class Pipe:
         
         return None
 
+
+    def find_editblock_assistant_core(self, content, assistant_code_block):
+        """
+        Finds <editblock_assistant_core> tags and applies edit blocks to the assistant_code_block
+        """
+        log.info("Finding editblock assistant core...")
+        # Define the regex pattern to match the XML tags
+        pattern = re.compile(
+            r"<(editblock_assistant_core)(\s+[^>]*)?>(.*?)</\1>",
+            re.DOTALL | re.MULTILINE,
+        )
+
+        # Find all matches in the content
+        matches = pattern.findall(content)
+
+        # If no matches found, return the original assistant_code_block
+        if not matches:
+            return assistant_code_block
+
+        # Process each match
+        for match in matches:
+            log.info("EditBlock match found")
+            # Extract the tag content and strip backticks
+            tag_content = self.strip_triple_backtick(match[2])
+
+            # Parse for edit blocks with search/replace format
+            search_replace_pattern = re.compile(
+                r'<{5,9} SEARCH\s*\n(.*?)\n={5,9}\s*\n(.*?)\n>{5,9} REPLACE',
+                re.DOTALL
+            )
+            edit_blocks = search_replace_pattern.findall(tag_content)
+
+            for original, updated in edit_blocks:
+                try:
+                    # Try to apply the edit directly if exact match exists
+                    if original in assistant_code_block:
+                        assistant_code_block = assistant_code_block.replace(original, updated)
+                        log.info("Applied exact match edit")
+                    else:
+                        # Try fuzzy matching if exact match fails
+                        import difflib
+                        lines = assistant_code_block.splitlines(True)
+                        original_lines = original.splitlines(True)
+
+                        for i in range(len(lines) - len(original_lines) + 1):
+                            chunk = ''.join(lines[i:i + len(original_lines)])
+                            similarity = difflib.SequenceMatcher(None, chunk, original).ratio()
+                            if similarity > 0.8:  # 80% similarity threshold
+                                updated_lines = lines[:i] + updated.splitlines(True) + lines[i + len(original_lines):]
+                                assistant_code_block = ''.join(updated_lines)
+                                log.info(f"Applied fuzzy match edit (similarity: {similarity:.2f})")
+                                break
+                        else:
+                            log.warning("Could not find matching code segment to edit")
+                except Exception as e:
+                    log.error(f"Error applying edit: {e}")
+
+        return assistant_code_block

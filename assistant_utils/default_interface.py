@@ -967,7 +967,7 @@ class Assistant:
                         content=content,
                         execute=True,
                         lang=lang,
-                        timeout=-1,
+                        timeout=300,
                     )
                     return f"Executed code: {filename}", result
                 except Exception as e:

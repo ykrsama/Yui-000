@@ -12,6 +12,7 @@ from queue import Queue
 from jinja2 import Template
 from datetime import datetime
 from dataclasses import dataclass
+from open_webui.retrieval.vector.connector import VECTOR_DB_CLIENT
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from prompt import (
