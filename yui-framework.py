@@ -303,8 +303,6 @@ class Pipe:
         # Process each match
         for match in matches:
             log.info("EditBlock match found")
-            # Extract the tag content and strip backticks
-            tag_content = self.strip_triple_backtick(match[2])
 
             # Parse for edit blocks with search/replace format
             search_replace_pattern = re.compile(
