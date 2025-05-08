@@ -303,6 +303,7 @@ class Pipe:
         # Process each match
         for match in matches:
             log.info("EditBlock match found")
+            tag_content = match[2]
 
             # Parse for edit blocks with search/replace format
             search_replace_pattern = re.compile(
